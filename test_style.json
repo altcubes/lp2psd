@@ -1,0 +1,16 @@
+{
+  "outputDir": "testout",
+  "font": {
+    "name": "Microsoft YaHei",
+    "fontSize": 24,
+    "color": [0, 0, 0],
+    "antiAlias": "smooth",
+    "orientation": "vertical",
+    "justification": "center",
+    "autoLeading": true,
+    "autoLeadingSize": 1.25,
+    "leading": 0,
+    "discretionaryLigatures": true,
+    "standardVerticalRomanAlignment": true
+  }
+}
