@@ -1,4 +1,6 @@
 #include "psd_writer.hpp"
+#include "psd_writer_internal.hpp"
+#include "txt2_templates.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -52,6 +54,20 @@ void Buffer::pad(size_t align) {
 }
 size_t Buffer::size() const { return b_.size(); }
 const std::vector<uint8_t>& Buffer::data() const { return b_; }
+
+// ===========================================================================
+// Tagged block helper ("8BIM" + 4-char key + length + data)
+// ===========================================================================
+namespace {
+
+void write_tagged(Buffer& b, const char* key, const std::vector<uint8_t>& data) {
+    b.raw("8BIM");
+    b.raw(key);
+    b.u32((uint32_t)data.size());
+    b.raw(data);
+}
+
+}  // namespace
 
 // ===========================================================================
 // UTF-8 helpers
@@ -129,6 +145,255 @@ int utf16_length(const std::string& s) {
 }
 
 }  // namespace (UTF-8 helpers)
+
+// ===========================================================================
+// Text engine data (Txt2) block
+//
+// Photoshop saves, per document, a "Text Engine Data" tagged block (Txt2)
+// in the additional layer information. It holds the per-layer text, fonts,
+// glyph ids and rendered layout in a compact numeric-key markup. Photoshop
+// validates the glyph ids against the layer text when opening a file; when
+// the block is missing or the ids do not match, it shows the
+// "text layers might need to be updated" prompt. The bytes below are copied
+// from Photoshop-saved reference files and re-stamped with the document's
+// text/font/glyphs.
+// ===========================================================================
+namespace {
+
+bool replace_one(std::string& s, const std::string& from, const std::string& to) {
+    size_t p = s.find(from);
+    if (p == std::string::npos) return false;
+    s.replace(p, from.size(), to);
+    return true;
+}
+
+void replace_all(std::string& s, const std::string& from, const std::string& to) {
+    size_t p = 0;
+    while ((p = s.find(from, p)) != std::string::npos) {
+        s.replace(p, from.size(), to);
+        p += to.size();
+    }
+}
+
+std::string fmt5(double v) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.5f", v);
+    return buf;
+}
+
+std::string bytes_to_string(const unsigned char* data, size_t n) {
+    return std::string(reinterpret_cast<const char*>(data), n);
+}
+
+std::string utf16be_string(const std::string& utf8) {
+    std::vector<uint8_t> u16 = utf8_to_utf16be(utf8);
+    std::string s = "(\xfe\xff";
+    s.append(u16.begin(), u16.end());
+    s += ')';
+    return s;
+}
+
+// Builds one per-layer element of the Txt2 '/1 [...]' list.
+std::string build_txt2_element(const TextLayerData& t, bool vertical) {
+    const unsigned char* templ =
+        vertical ? txt2_template::kTxt2ElementV : txt2_template::kTxt2ElementH;
+    size_t templ_len =
+        vertical ? txt2_template::kTxt2ElementV_len
+                 : txt2_template::kTxt2ElementH_len;
+    std::string e = bytes_to_string(templ, templ_len);
+
+    // Engine text: newlines become \r, plus a trailing \r (same convention
+    // as the TySh EngineData text).
+    std::string engine = t.text;
+    for (char& c : engine)
+        if (c == '\n') c = '\r';
+    engine += '\r';
+    if (!replace_one(e, utf16be_string("中文文本\r"), utf16be_string(engine)))
+        return {};
+
+    int count = utf16_length(engine);  // text chars + trailing line break
+    if (t.glyphs.size() != (size_t)count) return {};
+    if (t.run_ends.empty() || t.run_extent_em.size() != t.run_ends.size() ||
+        t.run_is_space.size() != t.run_ends.size())
+        return {};
+
+    // Paragraph/style run lengths ('/1 5' == text length incl. the break).
+    replace_all(e, "/1 5", "/1 " + std::to_string(count));
+    if (!replace_one(e, "41.66667", fmt5(t.font_size))) return {};
+    // Style-sheet reference count in the head ('/S /15 << /0 <count> ...').
+    replace_all(e, "/S /15 << /0 5 /2 0 /5 false",
+                "/S /15 << /0 " + std::to_string(count) + " /2 0 /5 false");
+
+    // Split the reference element into head / single run / tail at the
+    // first glyph-run block, then regenerate the run list for this text.
+    std::string head, tail;
+    {
+        size_t p = e.find("<< /99 /G");
+        if (p == std::string::npos) return {};
+        head = e.substr(0, p);
+        size_t q = p;
+        int depth = 0;
+        while (q + 2 <= e.size()) {
+            if (e.compare(q, 2, "<<") == 0) {
+                depth++;
+                q += 2;
+            } else if (e.compare(q, 2, ">>") == 0) {
+                depth--;
+                q += 2;
+                if (depth == 0) break;
+            } else {
+                q++;
+            }
+        }
+        tail = e.substr(q);
+    }
+
+    const double em = t.font_size;
+    const double half = em / 2.0;
+    const double asc = t.ascent_em * em;
+    const double desc = t.descent_em * em;
+    const double space_adv = t.space_advance_em * em;
+
+    double total = 0.0;
+    for (double x : t.run_extent_em) total += x * em;
+    double top = -total / 2.0;
+
+    const size_t n_runs = t.run_ends.size();
+    std::string runs;
+    int prev_end = 0;
+    for (size_t ri = 0; ri < n_runs; ri++) {
+        int end = t.run_ends[ri];
+        int chars = end - prev_end;
+        double height = t.run_extent_em[ri] * em;
+        bool last = ri + 1 == n_runs;
+        bool is_space = t.run_is_space[ri];
+
+        // Glyph slice of this run; the last run includes the trailing
+        // line-break glyph.
+        int g_start = prev_end;
+        int g_end = last ? (int)t.glyphs.size() : end;
+        std::string gs;
+        for (int gi = g_start; gi < g_end; gi++) {
+            if (gi > g_start) gs += ' ';
+            gs += std::to_string(t.glyphs[gi]);
+        }
+        int gcount = g_end - g_start;
+        double bottom = top + height;
+
+        std::string r = "<< /99 /G ";
+        if (ri > 0) {
+            // Run start position (relative to the first run's top/left).
+            double pos = top - (-total / 2.0);
+            if (vertical)
+                r += "/0 << /0 [ " + fmt5(pos) + " 0.0 ] >> ";
+            else
+                r += "/0 << /0 [ " + fmt5(pos) + " 0.0 ] >> ";
+        }
+        if (vertical) {
+            r += "/1 [ 0.0 " + fmt5(-half) + " " + fmt5(height) + " " +
+                 fmt5(half) + " ] ";
+        } else {
+            r += "/1 [ 0.0 " + fmt5(-asc) + " " + fmt5(height) + " " +
+                 fmt5(desc) + " ] ";
+        }
+        r += "/5 [ " + gs + " ] ";
+        if (vertical) {
+            r += "/8 [ " + fmt5(-half) + " " + fmt5(top) + " " + fmt5(half) +
+                 " " + fmt5(bottom) + " ] ";
+            // Photoshop omits /9 on the first run when there are several
+            // runs; single-run layers keep it. The space run's /9 box ends
+            // at a small fixed offset (0.163 em) from the block center.
+            if (ri > 0 || n_runs == 1) {
+                double nine_bottom =
+                    is_space ? 0.163 * em : bottom + em;
+                r += "/9 [ " + fmt5(-half) + " " + fmt5(top) + " " +
+                     fmt5(half) + " " + fmt5(nine_bottom) + " ] ";
+            }
+        } else {
+            r += "/8 [ " + fmt5(-height / 2.0) + " " + fmt5(-asc) + " " +
+                 fmt5(height / 2.0) + " " + fmt5(desc) + " ] ";
+            if (ri > 0 || n_runs == 1)
+                r += "/9 [ " + fmt5(-height / 2.0) + " " + fmt5(-asc) + " " +
+                     fmt5(height / 2.0 + space_adv) + " " + fmt5(desc) + " ] ";
+        }
+        r += "/10 << /0 [ ";
+        if (ri == 0) {
+            r += "<< /3 1 /9 0 /10 0 >> ";
+        } else {
+            r += "<< /0 " + std::to_string(prev_end) + " /3 " +
+                 (is_space ? "2" : "1") + " /9 0 /10 0 >> ";
+        }
+        r += "] /1 [ " + std::to_string(gcount) + " ] >> ";
+        if (last) r += "/11 true ";
+        r += "/12 " + fmt5(vertical ? -half : -asc) + " /13 " +
+             fmt5(vertical ? half : desc) + " /20 0 >>";
+        runs += r;
+
+        top = bottom;
+        prev_end = end;
+    }
+
+    std::string out = head + runs + tail;
+    // Line start position in the head (block edge): -total/2.
+    {
+        size_t p = out.find("<< /0 [ -");
+        if (p != std::string::npos) {
+            size_t sp = out.find(' ', p + 9);
+            if (sp != std::string::npos) {
+                size_t sp2 = out.find(' ', sp + 1);
+                if (sp2 != std::string::npos)
+                    out.replace(p + 9, sp2 - (p + 9),
+                                fmt5(-total / 2.0) + " ");
+            }
+        }
+    }
+    // /L line box and /12 /13 values for horizontal text.
+    if (!vertical) {
+        replace_all(out, "-35.72591", fmt5(-asc));
+        replace_all(out, "10.64046", fmt5(desc));
+    }
+    return out;
+}
+
+// Builds the full Txt2 block body for every text layer of the document.
+std::vector<uint8_t> build_txt2_body(
+    const std::vector<const TextLayerData*>& layers) {
+    if (layers.empty()) return {};
+    bool vertical = layers.front()->orientation != 0;
+    const unsigned char* prefix =
+        vertical ? txt2_template::kTxt2PrefixV : txt2_template::kTxt2PrefixH;
+    size_t prefix_len =
+        vertical ? txt2_template::kTxt2PrefixV_len
+                 : txt2_template::kTxt2PrefixH_len;
+    const unsigned char* suffix =
+        vertical ? txt2_template::kTxt2SuffixV : txt2_template::kTxt2SuffixH;
+    size_t suffix_len =
+        vertical ? txt2_template::kTxt2SuffixV_len
+                 : txt2_template::kTxt2SuffixH_len;
+
+    std::string body = bytes_to_string(prefix, prefix_len);
+
+    // Font name slot inside the prefix (reference fonts: YWHeiTI-Medium for
+    // the vertical template, MicrosoftYaHei for the horizontal one).
+    const std::string ref_font =
+        vertical ? "YWHeiTI-Medium" : "MicrosoftYaHei";
+    if (!replace_one(body, utf16be_string(ref_font),
+                     utf16be_string(layers.front()->font)))
+        return {};
+
+    std::string elems;
+    for (const TextLayerData* t : layers) {
+        std::string el = build_txt2_element(*t, vertical);
+        if (el.empty()) return {};
+        if (!elems.empty()) elems += ' ';
+        elems += el;
+    }
+    body += elems;
+    body.append(reinterpret_cast<const char*>(suffix), suffix_len);
+    return std::vector<uint8_t>(body.begin(), body.end());
+}
+
+}  // namespace (Txt2)
 
 // ===========================================================================
 // Descriptor value factories
@@ -259,7 +524,9 @@ void write_dvalue(Buffer& b, const DValue& v) {
 // ===========================================================================
 std::string fmt_float(double v) {
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "%.8f", v);
+    // Photoshop's engine data serializes floats with 5 fractional digits
+    // (e.g. 41.666667 -> "41.66667", 1.2 -> "1.2" after stripping zeros).
+    std::snprintf(buf, sizeof(buf), "%.5f", v);
     std::string s(buf);
     while (!s.empty() && s.back() == '0') s.pop_back();
     if (!s.empty() && s.back() == '.') s += '0';
@@ -376,6 +643,8 @@ std::vector<uint8_t> engine_bytes(const EDict& root) {
 // ===========================================================================
 // Text-engine template (structure of a real Photoshop-generated TySh)
 // ===========================================================================
+namespace {
+
 std::shared_ptr<EVal> eDictFrom(EDict d) {
     auto v = eDict();
     v->dict = std::move(d);
@@ -422,10 +691,11 @@ static double effective_leading(const TextLayerData& t) {
                           : (t.leading > 0.0 ? t.leading : t.font_size * t.auto_leading_size);
 }
 
-// EngineData FontSet/Script: 0=Roman, 1=Japanese, 2=Chinese, 3=Korean.
-// Real Photoshop files mark CJK fonts with their script; Latin script 0 on a
-// Chinese font makes Photoshop treat the text as non-CJK and is one source of
-// the "update text layer" / "font needs re-layout" prompt.
+// EngineData FontSet/Script: 0=Roman, 1=Japanese, 2=Traditional Chinese,
+// 3=Simplified Chinese, 4=Korean. Real Photoshop files mark CJK fonts with
+// their script; Latin script 0 on a Chinese font makes Photoshop treat the
+// text as non-CJK and is one source of the "update text layer" / "font needs
+// re-layout" prompt.
 static int font_script_of(const std::string& font) {
     std::string f;
     f.reserve(font.size());
@@ -433,60 +703,80 @@ static int font_script_of(const std::string& font) {
         if (c >= 'A' && c <= 'Z') f.push_back((char)(c - 'A' + 'a'));
         else if (c >= 'a' && c <= 'z') f.push_back(c);
     }
+    // CJK at all? (matched by any of the keyword substrings below)
     static const char* cjk[] = {
         "hei", "song", "ming", "kai", "fang", "yahei", "simsun", "simhei",
         "msyh", "simkai", "simfang", "dengxian", "pingfang", "sourcehansans",
         "sourcehanserif", "notosanscjk", "notoserifcjk", "notosanssc",
-        "notoserifsc", "han", "cjk", "sc", "cn", "wqy", "uming", "ukai",
+        "notoserifsc", "songti", "heiti", "kaiti", "fangsong", "nsimsun",
+        "lisu", "youyuan", "stcaiyun", "stliti", "stxinwei", "sthu po",
+        "fzshuti", "fzyaoti", "han", "cjk", "sc", "cn", "wqy", "uming", "ukai",
         "malgun", "gulim", "batang", "dotum", "applegothic", "hirakaku",
         "hiragino", "meiryo", "msmincho", "msgothic", "yumin", "ipaex",
     };
-    for (const char* k : cjk) {
-        if (f.find(k) != std::string::npos) {
-            // Japanese-specific names get 1, Korean-specific get 3, the rest
-            // (Chinese fonts like Microsoft YaHei) get 2.
-            if (std::string("hirakakuhiraginomeiryomsminchomsgothicyuminipaex").find(k) != std::string::npos)
-                return 1;
-            if (std::string("malgungulimbatangdotumapplegothic").find(k) != std::string::npos)
-                return 3;
-            return 2;
-        }
-    }
-    return 0;
+    bool is_cjk = false;
+    for (const char* k : cjk)
+        if (f.find(k) != std::string::npos) { is_cjk = true; break; }
+    if (!is_cjk) return 0;
+
+    // Category-specific names (checked against the full font name to avoid
+    // keyword collisions like "hei" inside "jhenghei").
+    static const char* jp[] = {
+        "hirakaku", "hiragino", "meiryo", "msmincho", "msgothic", "yumin",
+        "ipaex", "yugothic", "yumincho",
+    };
+    static const char* kr[] = {
+        "malgun", "gulim", "batang", "dotum", "applegothic",
+    };
+    static const char* tw[] = {
+        "mingliu", "pmingliu", "dfkai", "biaukai", "twkai", "tw-kai",
+        "jhenghei", "msjh", "lihei", "hkscs",
+    };
+    for (const char* k : jp)
+        if (f.find(k) != std::string::npos) return 1;
+    for (const char* k : kr)
+        if (f.find(k) != std::string::npos) return 4;
+    for (const char* k : tw)
+        if (f.find(k) != std::string::npos) return 2;
+    return 3;  // Simplified Chinese
 }
 
 EDict make_run_style(const TextLayerData& t, double r, double g, double bl) {
     EDict d;
-    // FontSet[0] is the AdobeInvisFont placeholder, the real font is index 1.
-    edict_set(d, "Font", eInt(1));
+    // FontSet[0] is the real font (current Photoshop layout).
+    edict_set(d, "Font", eInt(0));
     edict_set(d, "FontSize", eFlt(t.font_size));
-    edict_set(d, "AutoLeading", eBool(t.auto_leading));
-    edict_set(d, "Leading", eFlt(effective_leading(t)));
-    edict_set(d, "Tracking", eInt(0));
     edict_set(d, "AutoKerning", eBool(true));
     edict_set(d, "Kerning", eInt(0));
-    edict_set(d, "BaselineShift", eFlt(0.0));
     edict_set(d, "DLigatures", eBool(t.discretionary_ligatures));
-    // Standard vertical Roman alignment (Applies only to vertical text):
-    //   enabled  -> StyleRun BaselineDirection = 1
-    //   disabled -> field omitted entirely (real Photoshop CLOSE state)
-    // StyleSheetSet keeps the constant default 2 (written in make_resource_dict).
-    if (t.standard_vertical_roman) edict_set(d, "BaselineDirection", eInt(1));
-    edict_set(d, "FillColor", eDictFrom(make_fill_color(r, g, bl)));
-    edict_set(d, "StrokeColor", eDictFrom(make_stroke_color()));
-    edict_set(d, "HindiNumbers", eBool(false));
+    // Photoshop writes only non-default style properties into the run;
+    // defaults (auto leading, no tracking, black fill, ...) are omitted.
+    if (!t.auto_leading) {
+        edict_set(d, "AutoLeading", eBool(false));
+        edict_set(d, "Leading", eFlt(effective_leading(t)));
+    }
+    // Standard vertical Roman alignment (applies to vertical text only).
+    if (t.orientation == 1 && t.standard_vertical_roman)
+        edict_set(d, "BaselineDirection", eInt(1));
+    if (!(r == 0.0 && g == 0.0 && bl == 0.0))
+        edict_set(d, "FillColor", eDictFrom(make_fill_color(r, g, bl)));
     return d;
 }
 
-EDict make_full_style_data(const TextLayerData& t, double r, double g, double bl) {
+// The ResourceDict StyleSheetSet is a fixed Photoshop default (12 pt, black),
+// not the layer's actual style; the layer style lives in StyleRun.
+EDict make_full_style_data() {
     EDict d;
-    // FontSet[0] is the AdobeInvisFont placeholder, the real font is index 1.
-    edict_set(d, "Font", eInt(1));
-    edict_set(d, "FontSize", eFlt(t.font_size));
+    // The ResourceDict/DocumentResources default style sheet points at the
+    // CJK fallback entry (FontSet index 2, AdobeHeitiStd-Regular) exactly as
+    // Photoshop writes it; the layer's own text style (StyleRun) still uses
+    // FontSet index 0 (the configured font).
+    edict_set(d, "Font", eInt(2));
+    edict_set(d, "FontSize", eFlt(12.0));
     edict_set(d, "FauxBold", eBool(false));
     edict_set(d, "FauxItalic", eBool(false));
-    edict_set(d, "AutoLeading", eBool(t.auto_leading));
-    edict_set(d, "Leading", eFlt(effective_leading(t)));
+    edict_set(d, "AutoLeading", eBool(true));
+    edict_set(d, "Leading", eFlt(0.0));
     edict_set(d, "HorizontalScale", eFlt(1.0));
     edict_set(d, "VerticalScale", eFlt(1.0));
     edict_set(d, "Tracking", eInt(0));
@@ -498,13 +788,13 @@ EDict make_full_style_data(const TextLayerData& t, double r, double g, double bl
     edict_set(d, "Underline", eBool(false));
     edict_set(d, "Strikethrough", eBool(false));
     edict_set(d, "Ligatures", eBool(true));
-    edict_set(d, "DLigatures", eBool(t.discretionary_ligatures));
+    edict_set(d, "DLigatures", eBool(false));
     edict_set(d, "BaselineDirection", eInt(2));  // StyleSheetSet default, always 2
     edict_set(d, "Tsume", eFlt(0.0));
     edict_set(d, "StyleRunAlignment", eInt(2));
     edict_set(d, "Language", eInt(0));
     edict_set(d, "NoBreak", eBool(false));
-    edict_set(d, "FillColor", eDictFrom(make_fill_color(r, g, bl)));
+    edict_set(d, "FillColor", eDictFrom(make_fill_color(0.0, 0.0, 0.0)));
     edict_set(d, "StrokeColor", eDictFrom(make_stroke_color()));
     edict_set(d, "FillFlag", eBool(true));
     edict_set(d, "StrokeFlag", eBool(false));
@@ -526,7 +816,7 @@ EDict make_para_props(bool sheet_style, int justification, double auto_leading_s
     edict_set(d, "EndIndent", eFlt(0.0));
     edict_set(d, "SpaceBefore", eFlt(0.0));
     edict_set(d, "SpaceAfter", eFlt(0.0));
-    edict_set(d, "AutoHyphenate", eBool(sheet_style));
+    edict_set(d, "AutoHyphenate", eBool(true));
     edict_set(d, "HyphenatedWordSize", eInt(6));
     edict_set(d, "PreHyphen", eInt(2));
     edict_set(d, "PostHyphen", eInt(2));
@@ -535,7 +825,7 @@ EDict make_para_props(bool sheet_style, int justification, double auto_leading_s
     edict_set(d, "WordSpacing", eList({eFlt(0.8), eFlt(1.0), eFlt(1.33)}));
     edict_set(d, "LetterSpacing", eList({eFlt(0.0), eFlt(0.0), eFlt(0.0)}));
     edict_set(d, "GlyphSpacing", eList({eFlt(1.0), eFlt(1.0), eFlt(1.0)}));
-    edict_set(d, "AutoLeading", eFlt(auto_leading_size));
+    edict_set(d, "AutoLeading", eFlt(sheet_style ? 1.2 : auto_leading_size));
     edict_set(d, "LeadingType", eInt(sheet_style ? 0 : 1));
     edict_set(d, "Hanging", eBool(false));
     edict_set(d, "Burasagari", eBool(false));
@@ -677,14 +967,14 @@ EDict make_resource_dict(const TextLayerData& t) {
 
     auto hard = eDict();
     edict_set(hard->dict, "Name", eStr("PhotoshopKinsokuHard"));
-    edict_set(hard->dict, "NoStart", eStr("\u3001\u3002\uff0c\uff0e\uff65\uff1a\uff1b\uff1f\uff01\u30fc\u2015\u2019\uff09\u3011\uff3d\u3015\uff09\u3009\u300b\u300d\u3011\u3001\u30fd\u30fe\u3005\u3041\u3043\u3045\u3047\u3049\u3063\u3083\u3085\u3087\u308e\u30a1\u30a3\u30a5\u30a7\u30a9\u30c3\u30e3\u30e5\u30e7\u30f1\u30f2\u30f3\u309b\u309c?!)]},.:;\u2103\u2109\u00a2\uff05\u2030"));
-    edict_set(hard->dict, "NoEnd", eStr("\u2018\u201c\uff08\u3014\uff3b\u3016\uff5b\u3008\u300a\u300c\u300e\u3010([{\uffe5\uff04\u00a3\u20ac\u00a7\u3012\uff03"));
+    edict_set(hard->dict, "NoStart", eStr("\u3001\u3002\uff0c\uff0e\u30fb\uff1a\uff1b\uff1f\uff01\u30fc\u2015\u2019\u201d\uff09\u3015\uff3d\uff5d\u3009\u300b\u300d\u300f\u3011\u30fd\u30fe\u309d\u309e\u3005\u3041\u3043\u3045\u3047\u3049\u3063\u3083\u3085\u3087\u308e\u30a1\u30a3\u30a5\u30a7\u30a9\u30c3\u30e3\u30e5\u30e7\u30ee\u30f5\u30f6\u309b\u309c?!)]},.:;\u2103\u2109\u00a2\uff05\u2030"));
+    edict_set(hard->dict, "NoEnd", eStr("\u2018\u201c\uff08\u3014\uff3b\uff5b\u3008\u300a\u300c\u300e\u3010([{\uffe5\uff04\u00a3\uff20\u00a7\u3012\uff03"));
     edict_set(hard->dict, "Keep", eStr("\u2015\u2025"));
     edict_set(hard->dict, "Hanging", eStr("\u3001\u3002.,"));
     auto soft = eDict();
     edict_set(soft->dict, "Name", eStr("PhotoshopKinsokuSoft"));
-    edict_set(soft->dict, "NoStart", eStr("\u3001\u3002\uff0c\uff0e\uff65\uff1a\uff1b\uff1f\uff01\u2019\uff09\u3011\uff3d\u3015\uff09\u3009\u300b\u300d\u3011\u30fd\u30fe\u3005"));
-    edict_set(soft->dict, "NoEnd", eStr("\u2018\u201c\uff08\u3014\uff3b\u3016\uff5b\u3008\u300a\u300c\u300e\u3010"));
+    edict_set(soft->dict, "NoStart", eStr("\u3001\u3002\uff0c\uff0e\u30fb\uff1a\uff1b\uff1f\uff01\u2019\u201d\uff09\u3015\uff3d\uff5d\u3009\u300b\u300d\u300f\u3011\u30fd\u30fe\u309d\u309e\u3005"));
+    edict_set(soft->dict, "NoEnd", eStr("\u2018\u201c\uff08\u3014\uff3b\uff5b\u3008\u300a\u300c\u300e\u3010"));
     edict_set(soft->dict, "Keep", eStr("\u2015\u2025"));
     edict_set(soft->dict, "Hanging", eStr("\u3001\u3002.,"));
     edict_set(d, "KinsokuSet", eList({hard, soft}));
@@ -703,30 +993,39 @@ EDict make_resource_dict(const TextLayerData& t) {
     edict_set(d, "TheNormalParagraphSheet", eInt(0));
 
     EDict pss_item;
-    edict_set(pss_item, "Name", eStr("Normal RGB"));
+    edict_set(pss_item, "Name", eStr("正常 RGB"));
     edict_set(pss_item, "DefaultStyleSheet", eInt(0));
     edict_set(pss_item, "Properties",
-              eDictFrom(make_para_props(true, t.justification, t.auto_leading_size)));
+              eDictFrom(make_para_props(true, 0, t.auto_leading_size)));
     edict_set(d, "ParagraphSheetSet", eList({eDictFrom(pss_item)}));
 
     EDict sss_item;
-    edict_set(sss_item, "Name", eStr("Normal RGB"));
-    edict_set(sss_item, "StyleSheetData", eDictFrom(make_full_style_data(t, r, g, bl)));
+    edict_set(sss_item, "Name", eStr("正常 RGB"));
+    edict_set(sss_item, "StyleSheetData", eDictFrom(make_full_style_data()));
     edict_set(d, "StyleSheetSet", eList({eDictFrom(sss_item)}));
 
-    // Real Photoshop files always keep AdobeInvisFont as FontSet[0]; the
-    // actual font follows. FontType 0 = invis, 1 = TrueType, 2 = CFF/OTF.
+    // Current Photoshop layout: FontSet[0] is the real font, FontSet[1] the
+    // AdobeInvisFont placeholder, FontSet[2] the built-in CJK fallback
+    // (AdobeHeitiStd-Regular) used by the default style sheet.
+    // FontType 0 = invis, 1 = TrueType, 2 = CFF/OTF.
+    EDict font_item;
+    edict_set(font_item, "Name", eStr(t.font.empty() ? "ArialMT" : t.font));
+    edict_set(font_item, "Script",
+              eInt(t.script >= 0 ? t.script : font_script_of(t.font)));
+    edict_set(font_item, "FontType", eInt(1));
+    edict_set(font_item, "Synthetic", eInt(0));
     EDict invis;
     edict_set(invis, "Name", eStr("AdobeInvisFont"));
     edict_set(invis, "Script", eInt(0));
     edict_set(invis, "FontType", eInt(0));
     edict_set(invis, "Synthetic", eInt(0));
-    EDict font_item;
-    edict_set(font_item, "Name", eStr(t.font.empty() ? "ArialMT" : t.font));
-    edict_set(font_item, "Script", eInt(font_script_of(t.font)));
-    edict_set(font_item, "FontType", eInt(1));
-    edict_set(font_item, "Synthetic", eInt(0));
-    edict_set(d, "FontSet", eList({eDictFrom(invis), eDictFrom(font_item)}));
+    EDict heiti;
+    edict_set(heiti, "Name", eStr("AdobeHeitiStd-Regular"));
+    edict_set(heiti, "Script", eInt(3));
+    edict_set(heiti, "FontType", eInt(2));
+    edict_set(heiti, "Synthetic", eInt(0));
+    edict_set(d, "FontSet",
+              eList({eDictFrom(font_item), eDictFrom(invis), eDictFrom(heiti)}));
 
     edict_set(d, "SuperscriptSize", eFlt(0.583));
     edict_set(d, "SuperscriptPosition", eFlt(0.333));
@@ -744,6 +1043,8 @@ std::vector<uint8_t> make_engine_bytes(const TextLayerData& t) {
     edict_set(root, "DocumentResources", eDictFrom(res));
     return engine_bytes(root);
 }
+
+}  // namespace
 
 // ===========================================================================
 // PackBits RLE
@@ -819,7 +1120,8 @@ const char* blend4(BlendMode m) {
     return "norm";
 }
 
-uint8_t pct(int pct255) { return (uint8_t)(pct255 * 255 / 100); }
+// Converts an opacity in percent (0-100) to the 0-255 byte used in lrFX.
+uint8_t pct_to_byte(int pct100) { return (uint8_t)(pct100 * 255 / 100); }
 
 }  // namespace
 
@@ -871,10 +1173,104 @@ void edict_set(EDict& d, const std::string& key, std::shared_ptr<EVal> v) {
 // ===========================================================================
 // Public builders
 // ===========================================================================
+namespace {
+
+// Rough text width in em units (CJK glyphs = 1.0 em, Latin = 0.55 em), kept
+// in sync with main.cpp so the TySh layout matches the estimated box size.
+double est_line_units(const std::string& line) {
+    double units = 0;
+    size_t i = 0;
+    while (i < line.size()) {
+        uint8_t c = (uint8_t)line[i];
+        if (c < 0x80) {
+            units += 0.55;
+            i++;
+        } else if ((c & 0xE0) == 0xC0) i += 2, units += 0.55;
+        else if ((c & 0xF0) == 0xE0) i += 3, units += 1.0;
+        else i += 4, units += 1.0;
+    }
+    return units;
+}
+
+// Layout model of a real Photoshop point-text layer:
+//   - the TySh transform is the text anchor (document px);
+//   - the descriptor `bounds` is the em box in points, centered on the anchor;
+//   - the descriptor `boundingBox` is the rendered ink box in points,
+//     centered on the anchor (falls back to the em box without a preview).
+struct TyShLayout {
+    double anchor_x = 0, anchor_y = 0;          // document px
+    double em_l = 0, em_t = 0, em_r = 0, em_b = 0;     // pt, relative to anchor
+    double ink_l = 0, ink_t = 0, ink_r = 0, ink_b = 0; // pt, relative to anchor
+};
+
+TyShLayout tysh_layout(const TextLayerData& t) {
+    TyShLayout out;
+    out.anchor_x = t.box_x + t.box_w / 2.0;
+    out.anchor_y = t.box_y + t.box_h / 2.0;
+
+    std::vector<std::string> lines;
+    {
+        std::string cur;
+        for (char c : t.text) {
+            if (c == '\n') {
+                lines.push_back(cur);
+                cur.clear();
+            } else {
+                cur.push_back(c);
+            }
+        }
+        lines.push_back(cur);
+    }
+    if (lines.size() == 1 && lines[0].empty()) lines[0] = " ";
+    double max_units = 1.0;
+    int max_chars = 1;
+    for (const auto& ln : lines) {
+        max_units = std::max(max_units, est_line_units(ln));
+        max_chars = std::max(max_chars, utf16_length(ln));
+    }
+    double leading_pt =
+        t.auto_leading ? t.font_size * t.auto_leading_size
+                       : (t.leading > 0.0 ? t.leading
+                                          : t.font_size * t.auto_leading_size);
+    double half_w_pt, half_h_pt;
+    if (t.orientation == 1) {
+        // Vertical: one em per column, columns advance right-to-left; height
+        // is the tallest column (chars * font size), as in the reference PSD.
+        half_w_pt = std::max((double)lines.size() * t.font_size, t.font_size) / 2.0;
+        half_h_pt = std::max((double)max_chars * t.font_size, t.font_size) / 2.0;
+    } else {
+        half_w_pt = std::max(max_units * t.font_size, t.font_size) / 2.0;
+        half_h_pt = std::max((double)lines.size() * leading_pt, leading_pt) / 2.0;
+    }
+    out.em_l = -half_w_pt;
+    out.em_t = -half_h_pt;
+    out.em_r = half_w_pt;
+    out.em_b = half_h_pt;
+
+    if (!t.preview.empty() && t.ink_r > t.ink_l && t.ink_b > t.ink_t) {
+        // Type geometry lives in a 72-dpi space (1 pt == 1 px).
+        out.ink_l = t.ink_l - t.box_w / 2.0;
+        out.ink_t = t.ink_t - t.box_h / 2.0;
+        out.ink_r = t.ink_r - t.box_w / 2.0;
+        out.ink_b = t.ink_b - t.box_h / 2.0;
+    } else {
+        out.ink_l = out.em_l;
+        out.ink_t = out.em_t;
+        out.ink_r = out.em_r;
+        out.ink_b = out.em_b;
+    }
+    return out;
+}
+
+DValue dPt(double v) { return dUnit("#Pnt", v); }
+
+}  // namespace
+
 std::vector<uint8_t> build_tysh(const TextLayerData& t) {
     std::vector<uint8_t> engine = make_engine_bytes(t);
     Descriptor text_data;
-    text_data.class_id = "null";
+    text_data.class_id = "TxLr";
+    text_data.name.assign(1, '\0');
     std::string text0 = t.text;
     std::replace(text0.begin(), text0.end(), '\n', '\r');
     text0 += '\0';
@@ -882,17 +1278,18 @@ std::vector<uint8_t> build_tysh(const TextLayerData& t) {
     text_data.add("textGridding", dEnum("textGridding", "None"));
     text_data.add("Ornt", dEnum("Ornt", t.orientation ? "Vrtc" : "Hrzn"));
     text_data.add("AntA", dEnum("Annt", anti_alias_enum(t.anti_alias)));
+    TyShLayout lay = tysh_layout(t);
     DValue bounds = dObj("bounds");
-    bounds.obj->add("Left", dDouble(0.0));
-    bounds.obj->add("Top ", dDouble(0.0));
-    bounds.obj->add("Rght", dDouble(t.box_w));
-    bounds.obj->add("Btom", dDouble(t.box_h));
+    bounds.obj->add("Left", dPt(lay.em_l));
+    bounds.obj->add("Top ", dPt(lay.em_t));
+    bounds.obj->add("Rght", dPt(lay.em_r));
+    bounds.obj->add("Btom", dPt(lay.em_b));
     text_data.add("bounds", std::move(bounds));
     DValue bbox = dObj("boundingBox");
-    bbox.obj->add("Left", dDouble(0.0));
-    bbox.obj->add("Top ", dDouble(0.0));
-    bbox.obj->add("Rght", dDouble(t.box_w));
-    bbox.obj->add("Btom", dDouble(t.box_h));
+    bbox.obj->add("Left", dPt(lay.ink_l));
+    bbox.obj->add("Top ", dPt(lay.ink_t));
+    bbox.obj->add("Rght", dPt(lay.ink_r));
+    bbox.obj->add("Btom", dPt(lay.ink_b));
     text_data.add("boundingBox", std::move(bbox));
     text_data.add("TextIndex", dLong(0));
     text_data.add("EngineData", dRaw(engine));
@@ -908,7 +1305,7 @@ std::vector<uint8_t> build_tysh(const TextLayerData& t) {
     Buffer b;
     b.u16(1);
     b.f64(1.0); b.f64(0.0); b.f64(0.0); b.f64(1.0);
-    b.f64(t.box_x); b.f64(t.box_y);
+    b.f64(lay.anchor_x); b.f64(lay.anchor_y);
     b.u16(50);
     b.u32(16);
     write_descriptor(b, text_data);
@@ -921,13 +1318,6 @@ std::vector<uint8_t> build_tysh(const TextLayerData& t) {
 }
 
 std::vector<uint8_t> build_lrfx(const Effects& fx) {
-    auto add_block = [](Buffer& b, const char* key, const std::vector<uint8_t>& data) {
-        b.raw("8BIM");
-        b.raw(key);
-        b.u32((uint32_t)data.size());
-        b.raw(data);
-    };
-
     std::vector<std::pair<std::string, std::vector<uint8_t>>> blocks;
 
     Buffer c;
@@ -947,7 +1337,7 @@ std::vector<uint8_t> build_lrfx(const Effects& fx) {
         d.raw(blend4(s.blend));
         d.u8(s.enabled ? 1 : 0);
         d.u8(s.use_global_angle ? 1 : 0);
-        d.u8(pct(s.opacity));
+        d.u8(pct_to_byte(s.opacity));
         write_color(d, s.color);
         blocks.emplace_back("dsdw", d.data());
     }
@@ -964,7 +1354,7 @@ std::vector<uint8_t> build_lrfx(const Effects& fx) {
         d.raw(blend4(s.blend));
         d.u8(s.enabled ? 1 : 0);
         d.u8(s.use_global_angle ? 1 : 0);
-        d.u8(pct(s.opacity));
+        d.u8(pct_to_byte(s.opacity));
         write_color(d, s.color);
         blocks.emplace_back("isdw", d.data());
     }
@@ -978,7 +1368,7 @@ std::vector<uint8_t> build_lrfx(const Effects& fx) {
         d.raw("8BIM");
         d.raw(blend4(s.blend));
         d.u8(s.enabled ? 1 : 0);
-        d.u8(pct(s.opacity));
+        d.u8(pct_to_byte(s.opacity));
         write_color(d, s.color);
         blocks.emplace_back("oglw", d.data());
     }
@@ -992,7 +1382,7 @@ std::vector<uint8_t> build_lrfx(const Effects& fx) {
         d.raw("8BIM");
         d.raw(blend4(s.blend));
         d.u8(s.enabled ? 1 : 0);
-        d.u8(pct(s.opacity));
+        d.u8(pct_to_byte(s.opacity));
         d.u8(s.invert ? 1 : 0);
         write_color(d, s.color);
         blocks.emplace_back("iglw", d.data());
@@ -1011,8 +1401,8 @@ std::vector<uint8_t> build_lrfx(const Effects& fx) {
         write_color(d, s.highlight_color);
         write_color(d, s.shadow_color);
         d.u8((uint8_t)s.style);
-        d.u8(pct(s.highlight_opacity));
-        d.u8(pct(s.shadow_opacity));
+        d.u8(pct_to_byte(s.highlight_opacity));
+        d.u8(pct_to_byte(s.shadow_opacity));
         d.u8(s.enabled ? 1 : 0);
         d.u8(s.use_global_angle ? 1 : 0);
         d.u8(0);  // direction
@@ -1027,7 +1417,7 @@ std::vector<uint8_t> build_lrfx(const Effects& fx) {
         d.raw("8BIM");
         d.raw(blend4(s.blend));
         write_color(d, s.color);
-        d.u8(pct(s.opacity));
+        d.u8(pct_to_byte(s.opacity));
         d.u8(s.enabled ? 1 : 0);
         write_color(d, s.color);
         blocks.emplace_back("sofi", d.data());
@@ -1038,7 +1428,7 @@ std::vector<uint8_t> build_lrfx(const Effects& fx) {
     Buffer b;
     b.u16(0);
     b.u16((uint16_t)blocks.size());
-    for (const auto& blk : blocks) add_block(b, blk.first.c_str(), blk.second);
+    for (const auto& blk : blocks) write_tagged(b, blk.first.c_str(), blk.second);
     b.pad(4);
     return b.data();
 }
@@ -1095,13 +1485,6 @@ struct Chan {
     int16_t id;
     std::vector<uint8_t> bytes;
 };
-
-void write_tagged(Buffer& b, const char* key, const std::vector<uint8_t>& data) {
-    b.raw("8BIM");
-    b.raw(key);
-    b.u32((uint32_t)data.size());
-    b.raw(data);
-}
 
 // Image resources: resolution info (ID 0x03ED, as written by real
 // Photoshop). The 16.16 fixed-point values carry the document DPI so
@@ -1311,6 +1694,33 @@ static bool build_document_bytes(const Document& doc, std::vector<uint8_t>& byte
             write_tagged(extra, "infx", v.data());
             write_tagged(extra, "knko", v.data());
         }
+        {
+            // lspf: protected settings; lclr: sheet color (both all-zero,
+            // matching the reference PSD written by Photoshop).
+            write_tagged(extra, "lspf", std::vector<uint8_t>(4, 0));
+            write_tagged(extra, "lclr", std::vector<uint8_t>(8, 0));
+        }
+        if (auto tl = dynamic_cast<const TextLayer*>(l)) {
+            // shmd: layer metadata setting (fixed layout from a real PSD).
+            static const uint8_t shmd[] = {
+                0x00, 0x00, 0x00, 0x01, 0x38, 0x42, 0x49, 0x4d,
+                0x63, 0x75, 0x73, 0x74, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x10,
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x08, 0x6d, 0x65, 0x74, 0x61, 0x64, 0x61,
+                0x74, 0x61, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+                0x00, 0x09, 0x6c, 0x61, 0x79, 0x65, 0x72, 0x54,
+                0x69, 0x6d, 0x65, 0x64, 0x6f, 0x75, 0x62, 0x41,
+                0xda, 0x9c, 0xe3, 0x1e, 0x11, 0x80, 0xfd, 0x00,
+            };
+            write_tagged(extra, "shmd",
+                         std::vector<uint8_t>(shmd, shmd + sizeof(shmd)));
+            // fxrp: layer reference point = the text anchor (box center).
+            Buffer rp;
+            rp.f64(tl->text.box_x + tl->text.box_w / 2.0);
+            rp.f64(tl->text.box_y + tl->text.box_h / 2.0);
+            write_tagged(extra, "fxrp", rp.data());
+        }
         extra.pad(2);
 
         lm.u32((uint32_t)extra.size());
@@ -1327,6 +1737,30 @@ static bool build_document_bytes(const Document& doc, std::vector<uint8_t>& byte
     Buffer lm_outer;
     lm_outer.u32((uint32_t)lm.size());
     lm_outer.raw(lm.data());
+
+    // Additional layer information: an empty global layer mask followed by
+    // the Text Engine Data (Txt2) block. Photoshop uses the Txt2 glyph data
+    // to validate text layers; without it the file opens with the
+    // "some text layers might need to be updated" prompt.
+    {
+        std::vector<const TextLayerData*> text_layers;
+        for (const auto& rec : recs) {
+            if (auto tl = dynamic_cast<const TextLayer*>(rec.layer))
+                text_layers.push_back(&tl->text);
+        }
+        if (!text_layers.empty()) {
+            std::vector<uint8_t> body = build_txt2_body(text_layers);
+            if (!body.empty()) {
+                lm_outer.u32(0);  // global layer mask info: none
+                lm_outer.raw("8BIM");
+                lm_outer.raw("Txt2");
+                lm_outer.u32((uint32_t)body.size());
+                lm_outer.raw(body);
+                size_t pad = (4 - (body.size() % 4)) % 4;
+                for (size_t i = 0; i < pad; i++) lm_outer.u8(0);
+            }
+        }
+    }
 
     Buffer out;
     out.raw("8BPS");

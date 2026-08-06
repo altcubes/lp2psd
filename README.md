@@ -28,11 +28,16 @@ cmake --build build --config Release
 
 生成的可执行文件：`build\Release\psdgen.exe`
 
+GUI 外壳 `build\Release\psdgen-gui.exe` 由 CMake 的 `psdgen_gui` target 构建
+（运行 `build_gui.bat`，或
+`cmake --build build --config Release --target psdgen_gui`），
+需与 `psdgen.exe` 放在同一目录运行。
+
 > 如果不想用 CMake，也可以直接用 MSVC 编译器：
 >
 > ```bat
 > call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-> cl /nologo /std:c++17 /utf-8 /EHsc /O2 src\main.cpp src\psd_writer.cpp /Fe:psdgen.exe /link gdiplus.lib
+> cl /nologo /std:c++17 /utf-8 /EHsc /O2 src\main.cpp src\layout.cpp src\style.cpp src\image.cpp src\psd_writer.cpp /Fe:psdgen.exe /link gdiplus.lib comdlg32.lib shell32.lib
 > ```
 
 ## 使用
@@ -133,13 +138,28 @@ psdgen.exe text1.txt
 | `leading` | 手动行距（pt） | `autoLeading` 为 `false` 时生效；`0` 表示用 `autoLeadingSize` 计算 |
 | `discretionaryLigatures` | 自由连字（Discretionary Ligatures） | `true`/`false` |
 | `standardVerticalRomanAlignment` | 标准垂直罗马对齐（竖排时生效） | `true`/`false`（写入 EngineData `/BaselineDirection` 2/0） |
+| `postScript` | 可选：显式指定写入 PSD 的 PostScript 字体名 | 字符串，如 `"SimSun"`；不填时自动从 `name` 生成 |
+| `script` | 可选：EngineData 字体 Script | `auto`/`0`~`4`（0=罗马、1=日文、2=繁体中文、3=简体中文、4=韩文），默认 `auto` 按字体名自动判断 |
 
 `antiAlias`、`orientation`、`justification` 的值也支持中文写法
 （如 `"antiAlias": "平滑"`、`"orientation": "竖排"`、`"justification": "居中"`）。
 
+`font.name` 填 Windows 显示名或 PostScript 名均可。常见中文显示名
+（宋体、黑体、楷体、仿宋、微软雅黑、等线、隶书、幼圆、华文系列等）
+会自动映射为对应的 PostScript 名；若 PS 仍提示“无法找到字体”，可用
+`postScript` 直接指定（如 `"SimSun"`、`"KaiTi"`）。中文文本建议确认
+`script` 为 `auto`（中文名会自动判定为 3，即简体中文），或手动指定 `3`。
+
 ## 代码结构
 
-- `src/psd_writer.hpp/.cpp`：PSD 写入库（字节序、descriptor、EngineData、
-  TySh、lrFX、RLE、文档装配），纯 C++17，可独立复用
+- `src/psd_writer.hpp/.cpp` + `src/psd_writer_internal.hpp`：PSD 写入库
+  （公共文档模型在 `psd_writer.hpp`；字节序、descriptor、EngineData 等内部
+  机制在 `psd_writer_internal.hpp`），纯 C++17，可独立复用
+- `src/layout.hpp/.cpp`：排版 txt 解析（图片块、文本条目、分组）
+- `src/style.hpp/.cpp`：样式配置解析（字体、字号、文本样式）
+- `src/image.hpp/.cpp`：GDI+ 图片加载（含 DPI 读取）与文本预览渲染
+- `src/textcodec.hpp`：UTF-8/UTF-16/ANSI 文本转换与文本文件读取
+- `src/windows_ui.hpp`：CLI 与 GUI 共享的文件选择对话框、程序目录
 - `src/minijson.hpp`：极简 JSON 解析器
-- `src/main.cpp`：txt 解析、GDI+ 图片加载与文本渲染、CLI
+- `src/main.cpp`：CLI 编排（参数解析、文档装配、输出）
+- `src/gui_main.cpp`：Win32 GUI 外壳（独立 exe，调用 psdgen.exe）
