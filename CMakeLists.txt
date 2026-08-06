@@ -19,7 +19,7 @@ if(MSVC)
 endif()
 
 if(WIN32)
-    target_link_libraries(psdgen PRIVATE gdiplus gdi32 comdlg32 shell32)
+    target_link_libraries(psdgen PRIVATE gdiplus comdlg32 shell32)
 endif()
 
 # ---- GUI: psdgen-gui.exe (native Win32 wrapper around psdgen.exe) ----

@@ -112,24 +112,6 @@ struct TextLayerData {
     uint8_t color[3] = {255, 255, 255};
     double box_x = 0, box_y = 0, box_w = 100, box_h = 30; // document px
     std::vector<uint8_t> preview;  // optional RGBA8 preview w*h
-    // Glyph indices (font cmap) for the text plus the trailing line-break
-    // glyph. Written into the Txt2 text-engine-data block; Photoshop checks
-    // these against the layer text on open and asks to update the layer when
-    // they are missing or inconsistent.
-    std::vector<uint16_t> glyphs;
-    // Text runs split at spaces (each space is its own run). `run_ends[i]`
-    // is the UTF-16 character count up to and including run i (excluding the
-    // trailing line-break character). Photoshop stores one glyph run per
-    // text run; the space runs use the font's space glyph.
-    std::vector<int> run_ends;
-    // Layout extent of each run in em units: vertical height (char count,
-    // or the space advance for space runs) for vertical text, and the
-    // horizontal advance for horizontal text.
-    std::vector<double> run_extent_em;
-    // True for runs that consist of a single space character.
-    std::vector<bool> run_is_space;
-    // Font line metrics and space advance as fractions of the em square.
-    double ascent_em = 0.0, descent_em = 0.0, space_advance_em = 0.0;
     // Ink bounding box of the rendered preview, in px relative to the box
     // top-left corner. Zero width/height means "unknown" (no preview).
     double ink_l = 0.0, ink_t = 0.0, ink_r = 0.0, ink_b = 0.0;

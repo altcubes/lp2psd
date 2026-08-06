@@ -63,38 +63,6 @@ std::string group_name_of(const Layout& layout, int g) {
 // Document building
 // ===========================================================================
 
-// Returns the GDI-loadable family name for the configured font. The config
-// uses Photoshop PostScript names (e.g. "YWHeiTI-Medium"), which GDI cannot
-// load directly; DirectWrite maps them to the Windows family name. An empty
-// result means the font is not installed and the Txt2 block must be skipped.
-std::wstring resolve_gdi_font(const Style& style) {
-    static std::wstring cached_ps;
-    static std::wstring cached_family;
-    std::wstring ps = utf8_to_wide(style.font_ps);
-    if (cached_ps == ps) return cached_family;
-    std::wstring family;
-    bool ok = resolve_font_family(ps, family);
-    if (!ok) {
-        family = style.font_name;
-        ok = font_family_available(family);
-    }
-    cached_ps = ps;
-    cached_family = ok ? family : L"";
-    return cached_family;
-}
-
-// Photoshop renders ASCII letters/digits in vertical CJK manga fonts (e.g.
-// YW HeiTI) with the full-width glyphs. Convert the glyph lookup text
-// accordingly; the text stored in the PSD stays half-width.
-bool vertical_fullwidth_font(const std::wstring& family) {
-    std::wstring n;
-    for (wchar_t c : family) {
-        if (c >= L'A' && c <= L'Z') c += 32;
-        if (c != L' ' && c != L'-') n += c;
-    }
-    return n.find(L"ywheit") != std::wstring::npos;
-}
-
 // A txt line may contain literal "\r" / "\n" escape sequences to force extra
 // line breaks inside one physical line. Returns the resulting logical lines.
 std::vector<std::string> split_escaped_lines(const std::string& line) {
@@ -229,89 +197,6 @@ std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
                 tl->text.ink_b = ib + 1;
             }
         }
-    }
-
-    // Glyph indices for the Txt2 text-engine-data block. The glyph text uses
-    // a space for every line break plus a trailing space for the line-break
-    // glyph, matching the engine text (newlines -> \r) unit for unit.
-    // Photoshop validates these against the layer text on open.
-    std::wstring gdi_family = resolve_gdi_font(style);
-    if (!gdi_family.empty()) {
-        std::wstring gtext;
-        for (const auto& ln : lines) {
-            gtext += utf8_to_wide(ln);
-            gtext += L' ';
-        }
-        if (style.orientation == 1 && vertical_fullwidth_font(gdi_family)) {
-            for (wchar_t& c : gtext)
-                if (c >= 0x21 && c <= 0x7E) c += 0xFEE0;
-        }
-        std::vector<uint16_t> glyphs;
-        if (get_glyph_indices(gdi_family, gtext, glyphs)) {
-            tl->text.glyphs = std::move(glyphs);
-            fprintf(stderr, "[dbg] family=%ls glyphs=%d\n", gdi_family.c_str(),
-                    (int)tl->text.glyphs.size());
-        } else {
-            fprintf(stderr, "[dbg] get_glyph_indices FAILED family=%ls\n",
-                    gdi_family.c_str());
-        }
-    }
-
-    // Text runs (split at spaces) and layout metrics for the Txt2 block.
-    // Photoshop stores one glyph run per text run; a space becomes its own
-    // run with the font's space glyph.
-    if (!tl->text.glyphs.empty()) {
-        std::wstring chars;
-        for (const auto& ln : lines) {
-            chars += utf8_to_wide(ln);
-            chars += L' ';
-        }
-        if (!chars.empty()) chars.pop_back();  // trailing break glyph
-        if (style.orientation == 1 && vertical_fullwidth_font(gdi_family)) {
-            for (wchar_t& c : chars)
-                if (c >= 0x21 && c <= 0x7E) c += 0xFEE0;
-        }
-
-        std::vector<int> ends;
-        int start = 0;
-        for (int i = 0; i < (int)chars.size(); i++) {
-            if (chars[i] == L' ') {
-                if (i > start) ends.push_back(i);
-                ends.push_back(i + 1);
-                start = i + 1;
-            }
-        }
-        if (start < (int)chars.size()) ends.push_back((int)chars.size());
-        if (ends.empty()) ends.push_back((int)chars.size());
-        tl->text.run_ends = std::move(ends);
-
-        double asc_em = 0.8, desc_em = 0.2, space_adv = 0.3;
-        get_font_layout_metrics(gdi_family, asc_em, desc_em, space_adv);
-        tl->text.ascent_em = asc_em;
-        tl->text.descent_em = desc_em;
-        tl->text.space_advance_em = space_adv;
-
-        const auto& ends_r = tl->text.run_ends;
-        std::vector<double> extents;
-        std::vector<bool> is_space;
-        int prev = 0;
-        for (size_t ri = 0; ri < ends_r.size(); ri++) {
-            int end = ends_r[ri];
-            int count = end - prev;
-            bool sp = count == 1 && chars[prev] == L' ';
-            is_space.push_back(sp);
-            if (style.orientation == 1) {
-                extents.push_back(sp ? space_adv : (double)count);
-            } else {
-                double adv = 0.0;
-                get_text_advance_em(gdi_family, chars.substr(prev, count),
-                                    adv);
-                extents.push_back(adv);
-            }
-            prev = end;
-        }
-        tl->text.run_extent_em = std::move(extents);
-        tl->text.run_is_space = std::move(is_space);
     }
 
     return tl;
