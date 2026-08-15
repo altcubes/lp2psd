@@ -3,6 +3,7 @@
 根据 [LabelPlus](https://github.com/LabelPlus/LabelPlus) 生成的txt文件快速生成多图层 Photoshop PSD 的命令行工具
 输出可编辑文本图层（TySh + EngineData）、图层分组、GDI+ 预览合成图。
 
+**⚠️**LabelPlus生成的txt文件应与图片文件在同一目录下
 **⚠️**该程序生成的psd文件需要在ps中手动更新文本图层:文字(Y)->更新所有文本图层(U)
 
 ## 构建说明
