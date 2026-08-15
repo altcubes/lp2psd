@@ -1,0 +1,16 @@
+{
+  "dpi": "original",
+  "font": {
+    "antiAlias": "smooth",
+    "autoLeading": true,
+    "autoLeadingSize": 1.25,
+    "color": [0,0,0],
+    "discretionaryLigatures": true,
+    "fontSize": 24,
+    "justification": "center",
+    "leading": 0,
+    "name": "Microsoft YaHei",
+    "orientation": "vertical",
+    "standardVerticalRomanAlignment": true
+  }
+}

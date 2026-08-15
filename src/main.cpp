@@ -72,18 +72,18 @@ bool pick_text_file(std::wstring& out_path) {
 bool write_template_config(const std::wstring& path) {
     const char templ[] =
         "{\n"
-        "  \"outputDir\": \"out\",\n"
+        "  \"dpi\": \"original\",\n"
         "  \"font\": {\n"
         "    \"name\": \"Microsoft YaHei\",\n"
         "    \"fontSize\": 24,\n"
-        "    \"color\": [255, 235, 60],\n"
-        "    \"antiAlias\": \"strong\",\n"
-        "    \"orientation\": \"horizontal\",\n"
+        "    \"color\": [0, 0, 0],\n"
+        "    \"antiAlias\": \"smooth\",\n"
+        "    \"orientation\": \"vertical\",\n"
         "    \"justification\": \"center\",\n"
         "    \"autoLeading\": true,\n"
         "    \"autoLeadingSize\": 1.2,\n"
         "    \"leading\": 0,\n"
-        "    \"discretionaryLigatures\": false,\n"
+        "    \"discretionaryLigatures\": true,\n"
         "    \"standardVerticalRomanAlignment\": true\n"
         "  }\n"
         "}\n";
@@ -277,9 +277,14 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
     psdw::Document doc;
     doc.width = iw;
     doc.height = ih;
-    // Canvas DPI follows the source image (all images share the same DPI).
+    // Canvas DPI follows the source image (all images share the same DPI)
+    // unless config "dpi" overrides it with a fixed value.
     if (res_h < 1.0) res_h = 96.0;
     if (res_v < 1.0) res_v = 96.0;
+    if (style.dpi > 0.0) {
+        res_h = style.dpi;
+        res_v = style.dpi;
+    }
     doc.res_h = res_h;
     doc.res_v = res_v;
 

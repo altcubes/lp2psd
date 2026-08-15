@@ -177,6 +177,18 @@ Style load_style(const mjson::Value& cfg) {
         if (const mjson::Value* sc = f->get("script"))
             s.script = parse_script(*sc, s.script);
     }
+    if (const mjson::Value* d = cfg.get("dpi")) {
+        if (d->t == mjson::Value::T::Num) {
+            double v = d->num_or(0.0);
+            if (v >= 1.0 && v <= 10000.0) s.dpi = v;
+        } else if (d->t == mjson::Value::T::Str) {
+            // "original" / "auto" / 原图 均表示使用图片自身的 DPI。
+            std::string x = lower_ascii(d->str_or(""));
+            if (x == "original" || x == "auto" || x == "image" ||
+                x == "原图" || x == "自动")
+                s.dpi = 0.0;
+        }
+    }
     s.output_dir = cfg.get("outputDir") ? cfg.get("outputDir")->str_or("") : "";
     s.prefix = cfg.get("prefix") ? cfg.get("prefix")->str_or("") : "";
     s.suffix = cfg.get("suffix") ? cfg.get("suffix")->str_or("") : "";

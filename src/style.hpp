@@ -24,6 +24,9 @@ struct Style {
     // 0 = Roman, 1 = Japanese, 2 = Traditional Chinese,
     // 3 = Simplified Chinese, 4 = Korean.
     int script = -1;
+    // Document DPI: 0 = keep the source image's own resolution (原图值);
+    // > 0 = fixed document resolution (pixels/inch) overriding the image.
+    double dpi = 0.0;
     std::string output_dir;
     std::string prefix;
     std::string suffix;
