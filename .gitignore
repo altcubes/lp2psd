@@ -4,12 +4,4 @@ testout2/
 out/
 output/
 testfile/
-01.jpg
-02.jpg
-close.psd
-open.psd
-test_style_false.json
-test_style_num.json
-_preview02.png
-_preview01.png
-text1.txt
+config.json

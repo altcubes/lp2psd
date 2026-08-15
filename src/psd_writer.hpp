@@ -112,6 +112,10 @@ struct TextLayerData {
     uint8_t color[3] = {255, 255, 255};
     double box_x = 0, box_y = 0, box_w = 100, box_h = 30; // document px
     std::vector<uint8_t> preview;  // optional RGBA8 preview w*h
+    // Document resolution in pixels/inch. Type sizes (font_size, leading,
+    // TySh bounds) stay in the 72-dpi point space; the layer rectangle,
+    // preview raster and ink box are document pixels scaled by dpi/72.
+    double dpi = 96.0;
     // Ink bounding box of the rendered preview, in px relative to the box
     // top-left corner. Zero width/height means "unknown" (no preview).
     double ink_l = 0.0, ink_t = 0.0, ink_r = 0.0, ink_b = 0.0;

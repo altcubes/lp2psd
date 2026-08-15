@@ -1,4 +1,4 @@
-# psdgen — 根据 txt 排版文件生成多图层 PSD
+# lp2psd — 根据 txt 排版文件生成多图层 PSD
 
 用 C++（无第三方依赖）生成 Photoshop PSD 文件，支持：
 
@@ -26,27 +26,22 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
-生成的可执行文件：`build\Release\psdgen.exe`
-
-GUI 外壳 `build\Release\psdgen-gui.exe` 由 CMake 的 `psdgen_gui` target 构建
-（运行 `build_gui.bat`，或
-`cmake --build build --config Release --target psdgen_gui`），
-需与 `psdgen.exe` 放在同一目录运行。
+生成的可执行文件：`build\Release\lp2psd.exe`
 
 > 如果不想用 CMake，也可以直接用 MSVC 编译器：
 >
 > ```bat
 > call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-> cl /nologo /std:c++17 /utf-8 /EHsc /O2 src\main.cpp src\layout.cpp src\style.cpp src\image.cpp src\psd_writer.cpp /Fe:psdgen.exe /link gdiplus.lib comdlg32.lib shell32.lib
+> cl /nologo /std:c++17 /utf-8 /EHsc /O2 src\main.cpp src\layout.cpp src\style.cpp src\image.cpp src\psd_writer.cpp /Fe:lp2psd.exe /link gdiplus.lib comdlg32.lib shell32.lib
 > ```
 
 ## 使用
 
 ```bat
-psdgen.exe text1.txt
+lp2psd.exe text1.txt
 ```
 
-双击 `psdgen.exe`（不带参数）会弹出 Windows 文件选择器，选择一个排版
+双击 `lp2psd.exe`（不带参数）会弹出 Windows 文件选择器，选择一个排版
 文本文件即可开始生成。
 
 参数：
@@ -54,7 +49,8 @@ psdgen.exe text1.txt
 - `--out <目录>`：输出目录（默认是**文本文件所在目录下的 `output`**，
   不存在会自动创建）
 - `--config <style.json>`：样式配置（字体、字号、颜色、文本样式）；
-  默认读取**程序同目录下的 `config.json`**（没有则使用内置默认样式）
+  默认读取**程序同目录下的 `config.json`**（不存在时自动生成一份模板
+  `config.json` 并读取，修改后重新运行即可生效）
 - `--help`：帮助
 
 每个 `>>>>>>>>[图片名]<<<<<<<<` 块生成一个 `<图片名>.psd`。
@@ -129,7 +125,7 @@ psdgen.exe text1.txt
 
 | 字段 | 说明 | 取值 |
 |---|---|---|
-| `fontSize` | 字体大小，单位为**点（pt）**，与 Photoshop 字符面板一致 | 数字，如 `24`（文档未写分辨率，Photoshop 按 72 PPI 显示，此时 1pt = 1px） |
+| `fontSize` | 字体大小，单位为**点（pt）**，与 Photoshop 字符面板一致 | 数字，如 `24`。写入 PSD 时按文档 DPI 换算：文件值 = pt × DPI / 72，Photoshop 字符面板再按 ×72/DPI 显示回 pt，因此**与图像 DPI 无关，面板始终显示配置值** |
 | `antiAlias` | 抗锯齿 | `none`/`crisp`/`strong`/`smooth`/`sharp`/`lcd`（或数字 0/1/2/3/4/6，对应 Photoshop 的无/犀利/浑厚/平滑/锐利/LCD） |
 | `orientation` | 文本方向 | `horizontal`/`vertical`（或 0/1；竖排时每行文本成一列，列从右向左排列） |
 | `justification` | 文本对齐 | `left`/`right`/`center`/`justifyLastLeft`/`justifyLastRight`/`justifyLastCenter`/`justifyAll`（或数字 0~6） |
@@ -159,7 +155,5 @@ psdgen.exe text1.txt
 - `src/style.hpp/.cpp`：样式配置解析（字体、字号、文本样式）
 - `src/image.hpp/.cpp`：GDI+ 图片加载（含 DPI 读取）与文本预览渲染
 - `src/textcodec.hpp`：UTF-8/UTF-16/ANSI 文本转换与文本文件读取
-- `src/windows_ui.hpp`：CLI 与 GUI 共享的文件选择对话框、程序目录
 - `src/minijson.hpp`：极简 JSON 解析器
 - `src/main.cpp`：CLI 编排（参数解析、文档装配、输出）
-- `src/gui_main.cpp`：Win32 GUI 外壳（独立 exe，调用 psdgen.exe）

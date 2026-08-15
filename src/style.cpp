@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <string>
 #include <utility>
 
@@ -79,6 +80,22 @@ int parse_script(const mjson::Value& v, int dflt) {
     return dflt;
 }
 
+// Accepts a number or a numeric string (e.g. "fontSize": "30"); returns the
+// default for anything invalid or out of range.
+double parse_font_size(const mjson::Value& v, double dflt) {
+    if (v.t == mjson::Value::T::Num) {
+        double d = v.num_or(dflt);
+        return d > 0.0 && d < 10000.0 ? d : dflt;
+    }
+    if (v.t == mjson::Value::T::Str) {
+        const char* p = v.str.c_str();
+        char* end = nullptr;
+        double d = std::strtod(p, &end);
+        if (end != p && d > 0.0 && d < 10000.0) return d;
+    }
+    return dflt;
+}
+
 void read_color(const mjson::Value& v, uint8_t out[3], const uint8_t dflt[3]) {
     out[0] = dflt[0]; out[1] = dflt[1]; out[2] = dflt[2];
     if (v.t != mjson::Value::T::Arr || v.arr.size() < 3) return;
@@ -138,8 +155,8 @@ Style load_style(const mjson::Value& cfg) {
         if (const mjson::Value* ps = f->get("postScript"))
             if (ps->t == mjson::Value::T::Str && !ps->str.empty())
                 s.font_ps = ps->str;
-        s.font_size_pt =
-            f->get("fontSize") ? f->get("fontSize")->num_or(s.font_size_pt) : s.font_size_pt;
+        if (const mjson::Value* fs = f->get("fontSize"))
+            s.font_size_pt = parse_font_size(*fs, s.font_size_pt);
         if (const mjson::Value* c = f->get("color")) read_color(*c, s.color, s.color);
         if (const mjson::Value* a = f->get("antiAlias"))
             s.anti_alias = parse_anti_alias(*a, s.anti_alias);

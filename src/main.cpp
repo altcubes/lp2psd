@@ -1,4 +1,4 @@
-// psdgen - generate PSD files from a layout text file.
+// lp2psd - generate PSD files from a layout text file.
 //
 // Layout file format (see README "txt 格式"):
 //   <GroupName> --- (psd group name for group N)      (one line per group)
@@ -16,11 +16,13 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <commdlg.h>
 #include <shellapi.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,14 +33,68 @@
 #include "psd_writer.hpp"
 #include "style.hpp"
 #include "textcodec.hpp"
-#include "windows_ui.hpp"
 
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
 
 namespace {
 
 using textcodec::utf8_to_wide;
 using textcodec::wide_to_utf8;
+
+// Directory of the running executable, without a trailing separator.
+std::wstring exe_directory() {
+    wchar_t buf[MAX_PATH * 4];
+    DWORD n = GetModuleFileNameW(nullptr, buf, (DWORD)std::size(buf));
+    if (n == 0 || n >= std::size(buf)) return L"";
+    std::wstring p(buf, n);
+    size_t s = p.find_last_of(L"\\/");
+    return s == std::wstring::npos ? L"" : p.substr(0, s);
+}
+
+// Modal "open file" dialog for the layout text file. Returns false on cancel.
+bool pick_text_file(std::wstring& out_path) {
+    wchar_t file[MAX_PATH * 4] = L"";
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = L"Text files (*.txt)\0*.txt\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = (DWORD)std::size(file);
+    ofn.lpstrTitle = L"选择排版文本文件";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameW(&ofn)) return false;
+    out_path = file;
+    return true;
+}
+
+// Writes the default template config.json (UTF-8, no BOM). Returns false if
+// the file already exists or cannot be created.
+bool write_template_config(const std::wstring& path) {
+    const char templ[] =
+        "{\n"
+        "  \"outputDir\": \"out\",\n"
+        "  \"font\": {\n"
+        "    \"name\": \"Microsoft YaHei\",\n"
+        "    \"fontSize\": 24,\n"
+        "    \"color\": [255, 235, 60],\n"
+        "    \"antiAlias\": \"strong\",\n"
+        "    \"orientation\": \"horizontal\",\n"
+        "    \"justification\": \"center\",\n"
+        "    \"autoLeading\": true,\n"
+        "    \"autoLeadingSize\": 1.2,\n"
+        "    \"leading\": 0,\n"
+        "    \"discretionaryLigatures\": false,\n"
+        "    \"standardVerticalRomanAlignment\": true\n"
+        "  }\n"
+        "}\n";
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, templ, (DWORD)(sizeof(templ) - 1), &written, nullptr);
+    CloseHandle(h);
+    return ok && written == sizeof(templ) - 1;
+}
 
 // ===========================================================================
 // Path helpers
@@ -100,7 +156,8 @@ double line_units(const std::string& line) {
 
 std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
                                                  int ih, double font_size,
-                                                 const Style& style) {
+                                                 const Style& style,
+                                                 double dpi) {
     auto tl = std::make_shared<psdw::TextLayer>();
     std::vector<std::string> lines;
     for (const auto& ln : e.lines) {
@@ -118,13 +175,15 @@ std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
 
     double x = e.x * iw;
     double y = e.y * ih;
-    // Photoshop lays type layers out in a fixed 72-dpi space (1 pt == 1 px
-    // in the file), independent of the document resolution, so geometry and
-    // previews use the point size directly.
-    double font_size_px = font_size;
-    double leading_px = style.auto_leading ? font_size * style.auto_leading_size
-                                           : (style.leading > 0.0 ? style.leading
-                                                                  : font_size * style.auto_leading_size);
+    // Type sizes live in a 72-dpi point space, but the layer rectangle, the
+    // preview raster and the TySh anchor are document pixels. Scale by
+    // dpi/72 so a 20 pt layer occupies 20 * dpi/72 px in the document
+    // (e.g. 26.7 px at 96 dpi) and reads back as 20 pt.
+    const double px_scale = dpi / 72.0;
+    double font_size_px = font_size * px_scale;
+    double leading_px = (style.auto_leading ? font_size * style.auto_leading_size
+                                            : (style.leading > 0.0 ? style.leading
+                                                                   : font_size * style.auto_leading_size)) * px_scale;
     // Longest line in UTF-16 code units (vertical columns stack glyphs).
     int max_chars = 1;
     for (const auto& ln : lines)
@@ -161,6 +220,7 @@ std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
     tl->text.discretionary_ligatures = style.discretionary_ligatures;
     tl->text.standard_vertical_roman = style.standard_vertical_roman;
     tl->text.script = style.script;
+    tl->text.dpi = dpi;
 
     // Layer geometry must match the record rectangle exactly:
     // w = round(x+w) - round(x)
@@ -250,7 +310,7 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
         grp->open = true;
         for (const auto& e : blk.entries) {
             if (e.group != g) continue;
-            auto tl = make_text_layer(e, iw, ih, font_size, style);
+            auto tl = make_text_layer(e, iw, ih, font_size, style, res_h);
             if (tl) grp->children.push_back(tl);
         }
         if (!grp->children.empty()) doc.layers.push_back(grp);
@@ -259,7 +319,7 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
     // Entries without a group (group <= 0)
     for (const auto& e : blk.entries) {
         if (e.group > 0) continue;
-        auto tl = make_text_layer(e, iw, ih, font_size, style);
+        auto tl = make_text_layer(e, iw, ih, font_size, style, res_h);
         if (tl) doc.layers.push_back(tl);
     }
 
@@ -270,8 +330,8 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
 // CLI
 // ===========================================================================
 void print_usage() {
-    printf("psdgen - generate PSD files from a layout text file\n\n");
-    printf("usage: psdgen <layout.txt> [--out <dir>] [--config <style.json>]\n\n");
+    printf("lp2psd - generate PSD files from a layout text file\n\n");
+    printf("usage: lp2psd <layout.txt> [--out <dir>] [--config <style.json>]\n\n");
     printf("With no arguments a file dialog asks for the layout text file.\n");
     printf("The layout file references images in the same folder (one block per\n");
     printf("image) and places text layers at normalized positions with optional\n");
@@ -301,7 +361,7 @@ int wmain(int argc, wchar_t** argv) {
     if (txt_path.empty()) {
         // Interactive mode: double-click -> file picker.
         std::wstring picked;
-        if (!ui::pick_text_file(picked)) {
+        if (!pick_text_file(picked)) {
             printf("no file selected.\n");
             return 2;
         }
@@ -310,9 +370,20 @@ int wmain(int argc, wchar_t** argv) {
 
     // Font config: default to config.json next to the exe.
     if (cfg_path.empty()) {
-        std::wstring def = ui::exe_directory() + L"\\config.json";
+        std::wstring def = exe_directory() + L"\\config.json";
         if (GetFileAttributesW(def.c_str()) != INVALID_FILE_ATTRIBUTES)
             cfg_path = wide_to_utf8(def);
+    }
+    // No config anywhere: create the template config.json next to the exe so
+    // the user can edit it, then load it (this run keeps the defaults).
+    if (cfg_path.empty()) {
+        std::wstring def = exe_directory() + L"\\config.json";
+        if (write_template_config(def)) {
+            cfg_path = wide_to_utf8(def);
+            printf("config: 未找到 config.json，已生成模板 %s\n", cfg_path.c_str());
+        } else {
+            printf("config: 未找到 config.json，且无法创建模板，使用内置默认样式\n");
+        }
     }
 
     std::string err;
@@ -346,6 +417,7 @@ int wmain(int argc, wchar_t** argv) {
     printf("layout: %s (%d image block(s))\n", txt_path.c_str(),
            (int)layout.images.size());
     printf("output: %s\n", out_dir.c_str());
+    printf("config: %s\n", cfg_path.empty() ? "(none, built-in defaults)" : cfg_path.c_str());
     printf("font  : %s (%.1f pt)\n", wide_to_utf8(style.font_name).c_str(),
            style.font_size_pt);
 

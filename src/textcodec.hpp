@@ -1,8 +1,7 @@
 #pragma once
 // textcodec.hpp - UTF-8 / UTF-16 / system-ANSI text conversion helpers.
 //
-// Windows-only, header-only so both the CLI (psdgen) and the GUI wrapper
-// (psdgen-gui) share one implementation.
+// Windows-only, header-only text conversion helpers for lp2psd.
 
 #ifndef NOMINMAX
 #define NOMINMAX

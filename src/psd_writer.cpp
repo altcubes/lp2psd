@@ -495,7 +495,10 @@ EDict make_run_style(const TextLayerData& t, double r, double g, double bl) {
     EDict d;
     // FontSet[0] is the real font (current Photoshop layout).
     edict_set(d, "Font", eInt(0));
-    edict_set(d, "FontSize", eFlt(t.font_size));
+    // Photoshop stores type sizes in document pixels: the character panel
+    // shows pt = value * 72 / dpi, so write pt * dpi / 72 to keep the
+    // configured point size visible in Photoshop.
+    edict_set(d, "FontSize", eFlt(t.font_size * t.dpi / 72.0));
     edict_set(d, "AutoKerning", eBool(true));
     edict_set(d, "Kerning", eInt(0));
     edict_set(d, "DLigatures", eBool(t.discretionary_ligatures));
@@ -503,7 +506,7 @@ EDict make_run_style(const TextLayerData& t, double r, double g, double bl) {
     // defaults (auto leading, no tracking, black fill, ...) are omitted.
     if (!t.auto_leading) {
         edict_set(d, "AutoLeading", eBool(false));
-        edict_set(d, "Leading", eFlt(effective_leading(t)));
+        edict_set(d, "Leading", eFlt(effective_leading(t) * t.dpi / 72.0));
     }
     // Standard vertical Roman alignment (applies to vertical text only).
     if (t.orientation == 1 && t.standard_vertical_roman)
@@ -513,16 +516,19 @@ EDict make_run_style(const TextLayerData& t, double r, double g, double bl) {
     return d;
 }
 
-// The ResourceDict StyleSheetSet is a fixed Photoshop default (12 pt, black),
-// not the layer's actual style; the layer style lives in StyleRun.
-EDict make_full_style_data() {
+// The ResourceDict StyleSheetSet is Photoshop's default style sheet. Real
+// Photoshop keeps it at a fixed 12 pt black default because it always uses
+// StyleRun for the layer's own style; we follow the configured size here as
+// well so the font-size setting stays effective no matter which sheet the
+// text engine consults.
+EDict make_full_style_data(const TextLayerData& t) {
     EDict d;
     // The ResourceDict/DocumentResources default style sheet points at the
     // CJK fallback entry (FontSet index 2, AdobeHeitiStd-Regular) exactly as
     // Photoshop writes it; the layer's own text style (StyleRun) still uses
     // FontSet index 0 (the configured font).
     edict_set(d, "Font", eInt(2));
-    edict_set(d, "FontSize", eFlt(12.0));
+    edict_set(d, "FontSize", eFlt(t.font_size * t.dpi / 72.0));
     edict_set(d, "FauxBold", eBool(false));
     edict_set(d, "FauxItalic", eBool(false));
     edict_set(d, "AutoLeading", eBool(true));
@@ -751,7 +757,7 @@ EDict make_resource_dict(const TextLayerData& t) {
 
     EDict sss_item;
     edict_set(sss_item, "Name", eStr("正常 RGB"));
-    edict_set(sss_item, "StyleSheetData", eDictFrom(make_full_style_data()));
+    edict_set(sss_item, "StyleSheetData", eDictFrom(make_full_style_data(t)));
     edict_set(d, "StyleSheetSet", eList({eDictFrom(sss_item)}));
 
     // Current Photoshop layout: FontSet[0] is the real font, FontSet[1] the
@@ -949,8 +955,8 @@ double est_line_units(const std::string& line) {
 //     centered on the anchor (falls back to the em box without a preview).
 struct TyShLayout {
     double anchor_x = 0, anchor_y = 0;          // document px
-    double em_l = 0, em_t = 0, em_r = 0, em_b = 0;     // pt, relative to anchor
-    double ink_l = 0, ink_t = 0, ink_r = 0, ink_b = 0; // pt, relative to anchor
+    double em_l = 0, em_t = 0, em_r = 0, em_b = 0;     // doc px, relative to anchor
+    double ink_l = 0, ink_t = 0, ink_r = 0, ink_b = 0; // doc px, relative to anchor
 };
 
 TyShLayout tysh_layout(const TextLayerData& t) {
@@ -978,27 +984,32 @@ TyShLayout tysh_layout(const TextLayerData& t) {
         max_units = std::max(max_units, est_line_units(ln));
         max_chars = std::max(max_chars, utf16_length(ln));
     }
-    double leading_pt =
-        t.auto_leading ? t.font_size * t.auto_leading_size
-                       : (t.leading > 0.0 ? t.leading
-                                          : t.font_size * t.auto_leading_size);
-    double half_w_pt, half_h_pt;
+    // All TySh type geometry is stored in document pixels at the document
+    // resolution, exactly like real Photoshop files (FontSize, em box and
+    // layer rect all equal pt * dpi / 72 numerically).
+    const double fs_px = t.font_size * t.dpi / 72.0;
+    double leading_px =
+        t.auto_leading ? fs_px * t.auto_leading_size
+                       : (t.leading > 0.0 ? t.leading * t.dpi / 72.0
+                                          : fs_px * t.auto_leading_size);
+    double half_w, half_h;
     if (t.orientation == 1) {
         // Vertical: one em per column, columns advance right-to-left; height
         // is the tallest column (chars * font size), as in the reference PSD.
-        half_w_pt = std::max((double)lines.size() * t.font_size, t.font_size) / 2.0;
-        half_h_pt = std::max((double)max_chars * t.font_size, t.font_size) / 2.0;
+        half_w = std::max((double)lines.size() * fs_px, fs_px) / 2.0;
+        half_h = std::max((double)max_chars * fs_px, fs_px) / 2.0;
     } else {
-        half_w_pt = std::max(max_units * t.font_size, t.font_size) / 2.0;
-        half_h_pt = std::max((double)lines.size() * leading_pt, leading_pt) / 2.0;
+        half_w = std::max(max_units * fs_px, fs_px) / 2.0;
+        half_h = std::max((double)lines.size() * leading_px, leading_px) / 2.0;
     }
-    out.em_l = -half_w_pt;
-    out.em_t = -half_h_pt;
-    out.em_r = half_w_pt;
-    out.em_b = half_h_pt;
+    out.em_l = -half_w;
+    out.em_t = -half_h;
+    out.em_r = half_w;
+    out.em_b = half_h;
 
     if (!t.preview.empty() && t.ink_r > t.ink_l && t.ink_b > t.ink_t) {
-        // Type geometry lives in a 72-dpi space (1 pt == 1 px).
+        // Ink box is measured in preview pixels, i.e. the same document
+        // pixel space as the em box.
         out.ink_l = t.ink_l - t.box_w / 2.0;
         out.ink_t = t.ink_t - t.box_h / 2.0;
         out.ink_r = t.ink_r - t.box_w / 2.0;

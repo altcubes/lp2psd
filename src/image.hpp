@@ -1,7 +1,7 @@
 #pragma once
 // image.hpp - GDI+ image loading and text-preview rendering.
 //
-// psdgen renders a raster preview of every text layer so any viewer shows the
+// lp2psd renders a raster preview of every text layer so any viewer shows the
 // text; the editable text itself lives in the TySh/EngineData blocks.
 
 #ifndef NOMINMAX
