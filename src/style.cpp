@@ -192,5 +192,47 @@ Style load_style(const mjson::Value& cfg) {
     s.output_dir = cfg.get("outputDir") ? cfg.get("outputDir")->str_or("") : "";
     s.prefix = cfg.get("prefix") ? cfg.get("prefix")->str_or("") : "";
     s.suffix = cfg.get("suffix") ? cfg.get("suffix")->str_or("") : "";
+
+    if (const mjson::Value* o = cfg.get("ocr")) {
+        if (const mjson::Value* en = o->get("enabled"))
+            s.ocr.enabled = en->bool_or(false);
+        if (const mjson::Value* m = o->get("model"))
+            s.ocr.model = m->str_or(s.ocr.model);
+        if (const mjson::Value* v = o->get("limitSideLen"))
+            s.ocr.limit_side_len = (int)v->num_or(s.ocr.limit_side_len);
+        if (const mjson::Value* v = o->get("dbBinThreshold"))
+            s.ocr.det_thresh = v->num_or(s.ocr.det_thresh);
+        else if (const mjson::Value* v = o->get("detThresh"))  // legacy alias
+            s.ocr.det_thresh = v->num_or(s.ocr.det_thresh);
+        if (const mjson::Value* v = o->get("dbBoxThreshold"))
+            s.ocr.box_thresh = v->num_or(s.ocr.box_thresh);
+        if (const mjson::Value* v = o->get("dbUnclipRatio"))
+            s.ocr.unclip_ratio = v->num_or(s.ocr.unclip_ratio);
+        if (const mjson::Value* v = o->get("minSide"))
+            s.ocr.min_side = v->num_or(s.ocr.min_side);
+        if (const mjson::Value* v = o->get("segThreshold"))
+            s.ocr.seg_thresh = v->num_or(s.ocr.seg_thresh);
+        if (const mjson::Value* v = o->get("minBoxArea"))
+            s.ocr.min_box_area = (int)v->num_or(s.ocr.min_box_area);
+        if (const mjson::Value* wh = o->get("whiten")) {
+            if (const mjson::Value* v = wh->get("enabled"))
+                s.ocr.whiten.enabled = v->bool_or(s.ocr.whiten.enabled);
+            if (const mjson::Value* v = wh->get("color"))
+                read_color(*v, s.ocr.whiten.color, s.ocr.whiten.color);
+            if (const mjson::Value* v = wh->get("margin"))
+                s.ocr.whiten.margin = (int)v->num_or(s.ocr.whiten.margin);
+            if (const mjson::Value* v = wh->get("layerName"))
+                s.ocr.whiten.layer_name =
+                    v->str_or(s.ocr.whiten.layer_name);
+        }
+        if (const mjson::Value* bx = o->get("boxes")) {
+            if (const mjson::Value* v = bx->get("enabled"))
+                s.ocr.boxes.enabled = v->bool_or(s.ocr.boxes.enabled);
+            if (const mjson::Value* v = bx->get("color"))
+                read_color(*v, s.ocr.boxes.color, s.ocr.boxes.color);
+            if (const mjson::Value* v = bx->get("layerName"))
+                s.ocr.boxes.layer_name = v->str_or(s.ocr.boxes.layer_name);
+        }
+    }
     return s;
 }

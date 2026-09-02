@@ -3,4 +3,7 @@ testout/
 testout2/
 out/
 output/
+parity_out/
 testfile/
+third_party/
+*.onnx

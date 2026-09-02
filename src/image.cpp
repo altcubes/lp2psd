@@ -119,6 +119,41 @@ bool load_image(const std::wstring& path, std::vector<uint8_t>& rgba, int& w,
     return true;
 }
 
+bool save_image_png(const std::wstring& path, const std::vector<uint8_t>& rgba,
+                    int w, int h) {
+    if (w <= 0 || h <= 0 || rgba.size() != (size_t)w * h * 4) return false;
+    Bitmap bmp(w, h, PixelFormat32bppARGB);
+    if (bmp.GetLastStatus() != Ok) return false;
+    BitmapData data;
+    Rect rc(0, 0, w, h);
+    if (bmp.LockBits(&rc, ImageLockModeWrite, PixelFormat32bppARGB, &data) != Ok)
+        return false;
+    for (int y = 0; y < h; y++) {
+        uint8_t* row = (uint8_t*)data.Scan0 + (size_t)y * data.Stride;
+        const uint8_t* src = rgba.data() + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++) {
+            uint8_t* d = row + (size_t)x * 4;
+            d[0] = src[x * 4 + 2]; d[1] = src[x * 4 + 1];
+            d[2] = src[x * 4 + 0]; d[3] = src[x * 4 + 3];
+        }
+    }
+    bmp.UnlockBits(&data);
+
+    CLSID png_clsid{};
+    UINT num = 0, sz = 0;
+    if (GetImageEncodersSize(&num, &sz) != Ok || sz == 0) return false;
+    std::vector<BYTE> buf(sz);
+    ImageCodecInfo* codecs = (ImageCodecInfo*)buf.data();
+    if (GetImageEncoders(num, sz, codecs) != Ok) return false;
+    for (UINT i = 0; i < num; i++) {
+        if (wcscmp(codecs[i].MimeType, L"image/png") == 0) {
+            png_clsid = codecs[i].Clsid;
+            break;
+        }
+    }
+    return bmp.Save(path.c_str(), &png_clsid, nullptr) == Ok;
+}
+
 bool render_text_preview(const std::wstring& font_name, double size_px,
                          int w, int h, const uint8_t color[3], int orientation,
                          int justification, double line_advance,

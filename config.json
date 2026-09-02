@@ -1,16 +1,43 @@
 {
   "dpi": "original",
+  "outputDir": "",
+  "prefix": "",
+  "suffix": "",
   "font": {
+    "name": "Microsoft YaHei",
+    "postScript": "",
+    "fontSize": 24,
+    "color": [0, 0, 0],
     "antiAlias": "smooth",
+    "orientation": "vertical",
+    "justification": "left",
     "autoLeading": true,
     "autoLeadingSize": 1.25,
-    "color": [0,0,0],
-    "discretionaryLigatures": true,
-    "fontSize": 24,
-    "justification": "center",
     "leading": 0,
-    "name": "Microsoft YaHei",
-    "orientation": "vertical",
-    "standardVerticalRomanAlignment": true
+    "discretionaryLigatures": true,
+    "standardVerticalRomanAlignment": true,
+    "script": "auto"
+  },
+  "ocr": {
+    "enabled": false,
+    "model": "dbnet_detect.onnx",
+    "limitSideLen": 1024,
+    "dbBinThreshold": 0.5,
+    "dbBoxThreshold": 0.7,
+    "dbUnclipRatio": 2.3,
+    "minSide": 3.0,
+    "segThreshold": 0.12,
+    "minBoxArea": 64,
+    "whiten": {
+      "enabled": true,
+      "color": [255, 255, 255],
+      "margin": 3,
+      "layerName": "whites"
+    },
+    "boxes": {
+      "enabled": true,
+      "color": [255, 0, 0],
+      "layerName": "ocr_boxes"
+    }
   }
 }

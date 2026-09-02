@@ -30,6 +30,7 @@
 #include "image.hpp"
 #include "layout.hpp"
 #include "minijson.hpp"
+#include "ocr.hpp"
 #include "psd_writer.hpp"
 #include "style.hpp"
 #include "textcodec.hpp"
@@ -67,14 +68,19 @@ bool pick_text_file(std::wstring& out_path) {
     return true;
 }
 
-// Writes the default template config.json (UTF-8, no BOM). Returns false if
-// the file already exists or cannot be created.
+// Writes the default template config.json (UTF-8, no BOM) — the full
+// parameter set with manga-friendly defaults. Returns false if the file
+// already exists or cannot be created.
 bool write_template_config(const std::wstring& path) {
     const char templ[] =
         "{\n"
         "  \"dpi\": \"original\",\n"
+        "  \"outputDir\": \"\",\n"
+        "  \"prefix\": \"\",\n"
+        "  \"suffix\": \"\",\n"
         "  \"font\": {\n"
         "    \"name\": \"Microsoft YaHei\",\n"
+        "    \"postScript\": \"\",\n"
         "    \"fontSize\": 24,\n"
         "    \"color\": [0, 0, 0],\n"
         "    \"antiAlias\": \"smooth\",\n"
@@ -84,7 +90,30 @@ bool write_template_config(const std::wstring& path) {
         "    \"autoLeadingSize\": 1.2,\n"
         "    \"leading\": 0,\n"
         "    \"discretionaryLigatures\": true,\n"
-        "    \"standardVerticalRomanAlignment\": true\n"
+        "    \"standardVerticalRomanAlignment\": true,\n"
+        "    \"script\": \"auto\"\n"
+        "  },\n"
+        "  \"ocr\": {\n"
+        "    \"enabled\": false,\n"
+        "    \"model\": \"dbnet_detect.onnx\",\n"
+        "    \"limitSideLen\": 1024,\n"
+        "    \"dbBinThreshold\": 0.5,\n"
+        "    \"dbBoxThreshold\": 0.7,\n"
+        "    \"dbUnclipRatio\": 2.3,\n"
+        "    \"minSide\": 3.0,\n"
+        "    \"segThreshold\": 0.12,\n"
+        "    \"minBoxArea\": 64,\n"
+        "    \"whiten\": {\n"
+        "      \"enabled\": true,\n"
+        "      \"color\": [255, 255, 255],\n"
+        "      \"margin\": 3,\n"
+        "      \"layerName\": \"whites\"\n"
+        "    },\n"
+        "    \"boxes\": {\n"
+        "      \"enabled\": false,\n"
+        "      \"color\": [255, 0, 0],\n"
+        "      \"layerName\": \"ocr_boxes\"\n"
+        "    }\n"
         "  }\n"
         "}\n";
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
@@ -152,6 +181,207 @@ double line_units(const std::string& line) {
         else i += 4, units += 1.0;
     }
     return units;
+}
+
+// ===========================================================================
+// OCR-based whitening and font-size matching
+// ===========================================================================
+
+// Builds one pixel layer covering all detected text strokes: the per-pixel
+// stroke mask dilated by cfg.margin (to swallow anti-aliasing edges), filled
+// with opaque pixels. Returns null when there is nothing to draw.
+std::shared_ptr<psdw::PixelLayer> make_whiten_layer(
+    const std::vector<uint8_t>& stroke_mask, int iw, int ih,
+    const OcrWhiten& cfg) {
+    if (stroke_mask.size() != (size_t)iw * ih) return nullptr;
+    int l = iw, t = ih, r = 0, b = 0;
+    for (int y = 0; y < ih; y++) {
+        const uint8_t* row = &stroke_mask[(size_t)y * iw];
+        for (int x = 0; x < iw; x++) {
+            if (!row[x]) continue;
+            l = std::min(l, std::max(0, x - cfg.margin));
+            t = std::min(t, std::max(0, y - cfg.margin));
+            r = std::max(r, std::min(iw, x + cfg.margin + 1));
+            b = std::max(b, std::min(ih, y + cfg.margin + 1));
+        }
+    }
+    if (r <= l || b <= t) return nullptr;
+
+    auto pl = std::make_shared<psdw::PixelLayer>();
+    pl->name = cfg.layer_name;
+    pl->x = l; pl->y = t;
+    pl->w = r - l; pl->h = b - t;
+    pl->rgba.assign((size_t)pl->w * pl->h * 4, 0);  // transparent
+    const int m = std::max(0, cfg.margin);
+    for (int y = 0; y < ih; y++) {
+        const uint8_t* row = &stroke_mask[(size_t)y * iw];
+        for (int x = 0; x < iw; x++) {
+            if (!row[x]) continue;
+            int x0 = std::max(l, x - m), x1 = std::min(r, x + m + 1);
+            int y0 = std::max(t, y - m), y1 = std::min(b, y + m + 1);
+            for (int yy = y0; yy < y1; yy++) {
+                uint8_t* p = pl->rgba.data() +
+                             ((size_t)(yy - t) * pl->w + (x0 - l)) * 4;
+                for (int xx = x0; xx < x1; xx++) {
+                    p[0] = cfg.color[0]; p[1] = cfg.color[1];
+                    p[2] = cfg.color[2]; p[3] = 255;
+                    p += 4;
+                }
+            }
+        }
+    }
+    return pl;
+}
+
+// Expands a quad uniformly by `pad` pixels about its centroid.
+void expand_quad(const double* quad, int pad, double out[8]) {
+    double cx = 0, cy = 0;
+    for (int k = 0; k < 4; k++) { cx += quad[k * 2]; cy += quad[k * 2 + 1]; }
+    cx /= 4; cy /= 4;
+    for (int k = 0; k < 4; k++) {
+        double dx = quad[k * 2] - cx, dy = quad[k * 2 + 1] - cy;
+        double len = std::max(1.0, std::hypot(dx, dy));
+        out[k * 2] = quad[k * 2] + dx / len * pad;
+        out[k * 2 + 1] = quad[k * 2 + 1] + dy / len * pad;
+    }
+}
+
+// Draws a 1px line (Bresenham) into a pixel layer, clamped to its bounds.
+void draw_layer_line(std::vector<uint8_t>& rgba, int lw, int lh, int ox, int oy,
+                     int x0, int y0, int x1, int y1,
+                     uint8_t r, uint8_t g, uint8_t b) {
+    int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        int px = x0 - ox, py = y0 - oy;
+        if (px >= 0 && px < lw && py >= 0 && py < lh) {
+            uint8_t* p = rgba.data() + ((size_t)py * lw + px) * 4;
+            p[0] = r; p[1] = g; p[2] = b; p[3] = 255;
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+// Builds a transparent layer with a 1px outline around every detection quad
+// (expanded by the same margin used for whitening, so it marks roughly where
+// white was painted). Intended for the top of the layer stack. Returns null
+// when there is nothing to draw.
+std::shared_ptr<psdw::PixelLayer> make_box_outline_layer(
+    const std::vector<OcrBox>& boxes, int iw, int ih, int margin,
+    const OcrBoxes& cfg) {
+    int l = iw, t = ih, r = 0, b = 0;
+    for (const auto& box : boxes) {
+        double q[8];
+        expand_quad(box.quad, margin, q);
+        for (int k = 0; k < 4; k++) {
+            l = std::min(l, (int)std::floor(q[k * 2]));
+            t = std::min(t, (int)std::floor(q[k * 2 + 1]));
+            r = std::max(r, (int)std::ceil(q[k * 2]));
+            b = std::max(b, (int)std::ceil(q[k * 2 + 1]));
+        }
+    }
+    l = std::max(0, l); t = std::max(0, t);
+    r = std::min(iw, r); b = std::min(ih, b);
+    if (r <= l || b <= t) return nullptr;
+
+    auto pl = std::make_shared<psdw::PixelLayer>();
+    pl->name = cfg.layer_name;
+    pl->x = l; pl->y = t;
+    pl->w = r - l; pl->h = b - t;
+    pl->rgba.assign((size_t)pl->w * pl->h * 4, 0);  // transparent
+    for (const auto& box : boxes) {
+        double q[8];
+        expand_quad(box.quad, margin, q);
+        for (int k = 0; k < 4; k++) {
+            int k2 = (k + 1) % 4;
+            draw_layer_line(pl->rgba, pl->w, pl->h, l, t,
+                            (int)std::llround(q[k * 2]),
+                            (int)std::llround(q[k * 2 + 1]),
+                            (int)std::llround(q[k2 * 2]),
+                            (int)std::llround(q[k2 * 2 + 1]),
+                            cfg.color[0], cfg.color[1], cfg.color[2]);
+        }
+    }
+    return pl;
+}
+
+// Draws a quad outline onto an RGBA image (debug overlay).
+void draw_quad_outline(std::vector<uint8_t>& img, int iw, int ih,
+                       const double* quad,
+                       uint8_t r, uint8_t g, uint8_t b) {
+    for (int k = 0; k < 4; k++) {
+        int k2 = (k + 1) % 4;
+        draw_layer_line(img, iw, ih, 0, 0,
+                        (int)std::llround(quad[k * 2]),
+                        (int)std::llround(quad[k * 2 + 1]),
+                        (int)std::llround(quad[k2 * 2]),
+                        (int)std::llround(quad[k2 * 2 + 1]), r, g, b);
+    }
+}
+
+// Saves "<image stem>_ocr.png" with the stroke mask (green) and the rotated
+// detection quads (red) drawn, into debug_dir.
+void save_ocr_debug(const std::vector<uint8_t>& img, int iw, int ih,
+                    const std::vector<OcrBox>& boxes,
+                    const std::vector<uint8_t>& stroke_mask,
+                    const std::wstring& debug_dir, const std::string& stem) {
+    std::vector<uint8_t> overlay = img;
+    if (stroke_mask.size() == (size_t)iw * ih) {
+        for (size_t i = 0; i < stroke_mask.size(); i++) {
+            if (!stroke_mask[i]) continue;
+            uint8_t* p = overlay.data() + i * 4;
+            p[0] = (uint8_t)std::min(255, p[0] / 2 + 128);  // tint green
+            p[1] = (uint8_t)std::min(255, p[1] / 2 + 160);
+            p[2] = (uint8_t)std::min(255, p[2] / 2 + 64);
+        }
+    }
+    for (const auto& box : boxes)
+        draw_quad_outline(overlay, iw, ih, box.quad, 255, 0, 0);
+    save_image_png(debug_dir + L"\\" + utf8_to_wide(stem) + L"_ocr.png",
+                   overlay, iw, ih);
+
+    // Grayscale stroke mask + machine-readable quads, for parity checking
+    // against scripts/parity_detect.py.
+    std::vector<uint8_t> mask_rgba(stroke_mask.size() * 4, 0);
+    for (size_t i = 0; i < stroke_mask.size(); i++) {
+        uint8_t v = stroke_mask[i] ? 255 : 0;
+        uint8_t* p = &mask_rgba[i * 4];
+        p[0] = v; p[1] = v; p[2] = v; p[3] = 255;
+    }
+    save_image_png(debug_dir + L"\\" + utf8_to_wide(stem) + L"_mask.png",
+                   mask_rgba, iw, ih);
+
+    std::string js = "{\"boxes\":[";
+    for (size_t i = 0; i < boxes.size(); i++) {
+        if (i) js += ",";
+        const auto& box = boxes[i];
+        js += "{\"quad\":[";
+        for (int k = 0; k < 8; k++) {
+            if (k) js += ",";
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.3f", box.quad[k]);
+            js += buf;
+        }
+        js += "],\"score\":";
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.6f", box.score);
+        js += buf;
+        js += "}";
+    }
+    js += "]}";
+    HANDLE f = CreateFileW((debug_dir + L"\\" + utf8_to_wide(stem) +
+                            L"_quads.json").c_str(),
+                           GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(f, js.data(), (DWORD)js.size(), &written, nullptr);
+        CloseHandle(f);
+    }
 }
 
 std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
@@ -264,7 +494,8 @@ std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
 
 bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
                const std::wstring& out_path, const Style& style,
-               const Layout& layout, std::string* err) {
+               const Layout& layout, const std::wstring& debug_dir,
+               std::string* err) {
     std::wstring image_path = txt_dir + utf8_to_wide(blk.image);
     std::vector<uint8_t> img;
     int iw = 0, ih = 0;
@@ -272,6 +503,40 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
     if (!load_image(image_path, img, iw, ih, &res_h, &res_v)) {
         if (err) *err = "cannot load image: " + blk.image;
         return false;
+    }
+
+    // OCR text-region detection (optional, config "ocr"). Runs on the raw
+    // image; the rotated quads and the per-pixel stroke mask feed the
+    // whitening layer below.
+    std::vector<OcrBox> boxes;
+    std::vector<uint8_t> stroke_mask;
+    if (style.ocr.enabled) {
+        std::string oerr;
+        if (ocr_available()) {
+            OcrOptions opt;
+            opt.model_path = style.ocr.model;
+            opt.limit_side_len = style.ocr.limit_side_len;
+            opt.det_thresh = (float)style.ocr.det_thresh;
+            opt.box_thresh = (float)style.ocr.box_thresh;
+            opt.unclip_ratio = (float)style.ocr.unclip_ratio;
+            opt.min_side = (float)style.ocr.min_side;
+            opt.seg_thresh = (float)style.ocr.seg_thresh;
+            opt.min_box_area = style.ocr.min_box_area;
+            if (!ocr_detect(img, iw, ih, opt, boxes, stroke_mask, &oerr)) {
+                fprintf(stderr, "ocr: %s\n", oerr.c_str());
+            } else {
+                size_t strokes = 0;
+                for (uint8_t v : stroke_mask) strokes += v;
+                printf("ocr  : %s -> %d region(s), %zu stroke pixel(s)\n",
+                       blk.image.c_str(), (int)boxes.size(), strokes);
+            }
+            if (!debug_dir.empty())
+                save_ocr_debug(img, iw, ih, boxes, stroke_mask, debug_dir,
+                               stem_of(blk.image));
+        } else {
+            fprintf(stderr,
+                    "ocr: onnxruntime.dll unavailable, skipping detection\n");
+        }
     }
 
     psdw::Document doc;
@@ -293,6 +558,13 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
     bg->x = 0; bg->y = 0; bg->w = iw; bg->h = ih;
     bg->rgba = std::move(img);
     doc.layers.push_back(bg);
+
+    // Whitening layer directly above the background: covers the OCR-detected
+    // text regions without touching the "bg" pixels.
+    if (style.ocr.enabled && style.ocr.whiten.enabled) {
+        if (auto wl = make_whiten_layer(stroke_mask, iw, ih, style.ocr.whiten))
+            doc.layers.push_back(wl);
+    }
 
     // Font size in points (Photoshop unit). The document carries no resolution
     // info, so Photoshop uses 72 PPI and 1 pt == 1 px on screen.
@@ -328,6 +600,14 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
         if (tl) doc.layers.push_back(tl);
     }
 
+    // Detection-box outline layer on top: shows where white was painted.
+    if (style.ocr.enabled && style.ocr.boxes.enabled) {
+        if (auto bl = make_box_outline_layer(boxes, iw, ih,
+                                             style.ocr.whiten.margin,
+                                             style.ocr.boxes))
+            doc.layers.push_back(bl);
+    }
+
     return doc.write_wide(out_path, err);
 }
 
@@ -336,11 +616,16 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
 // ===========================================================================
 void print_usage() {
     printf("lp2psd - generate PSD files from a layout text file\n\n");
-    printf("usage: lp2psd <layout.txt> [--out <dir>] [--config <style.json>]\n\n");
+    printf("usage: lp2psd <layout.txt> [--out <dir>] [--config <style.json>]\n");
+    printf("                     [--debug-ocr <dir>]\n\n");
     printf("With no arguments a file dialog asks for the layout text file.\n");
     printf("The layout file references images in the same folder (one block per\n");
     printf("image) and places text layers at normalized positions with optional\n");
-    printf("group numbers. Each image produces <image>.psd.\n");
+    printf("group numbers. Each image produces <image>.psd.\n\n");
+    printf("Optional OCR (config \"ocr\"): detects Japanese text regions for\n");
+    printf("whitening (rotated quads + per-pixel stroke mask). Requires\n");
+    printf("onnxruntime.dll + the DBNet detection model next to the exe.\n");
+    printf("  --debug-ocr <dir>   save detection overlay PNGs/JSON to <dir>\n");
 }
 
 }  // namespace
@@ -349,12 +634,14 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
     GdiScope gdi;
 
-    std::string txt_path, out_dir, cfg_path;
+    std::string txt_path, out_dir, cfg_path, debug_dir;
     for (int i = 1; i < argc; i++) {
         std::string a = wide_to_utf8(std::wstring(argv[i]));
         if (a == "--out" && i + 1 < argc) out_dir = wide_to_utf8(std::wstring(argv[++i]));
         else if (a == "--config" && i + 1 < argc)
             cfg_path = wide_to_utf8(std::wstring(argv[++i]));
+        else if (a == "--debug-ocr" && i + 1 < argc)
+            debug_dir = wide_to_utf8(std::wstring(argv[++i]));
         else if (a == "--help" || a == "-h") { print_usage(); return 0; }
         else if (txt_path.empty()) txt_path = a;
         else {
@@ -419,6 +706,26 @@ int wmain(int argc, wchar_t** argv) {
     CreateDirectoryW(wout_dir.c_str(), nullptr);
     std::wstring wtxt_dir = utf8_to_wide(txt_dir);
 
+    // OCR model paths: absolute as-is; otherwise exe directory, then the
+    // current working directory.
+    auto resolve_model_path = [](std::string& path) {
+        if (path.empty()) return;
+        bool absolute = path.size() > 1 &&
+                        (path[1] == ':' || path[0] == '/' || path[0] == '\\');
+        if (absolute) return;
+        std::wstring model_w = utf8_to_wide(path);
+        std::wstring cand = exe_directory() + L"\\" + model_w;
+        if (GetFileAttributesW(cand.c_str()) == INVALID_FILE_ATTRIBUTES)
+            cand = model_w;
+        path = wide_to_utf8(cand);
+    };
+    resolve_model_path(style.ocr.model);
+    std::wstring wdebug_dir;
+    if (!debug_dir.empty()) {
+        wdebug_dir = utf8_to_wide(debug_dir);
+        CreateDirectoryW(wdebug_dir.c_str(), nullptr);
+    }
+
     printf("layout: %s (%d image block(s))\n", txt_path.c_str(),
            (int)layout.images.size());
     printf("output: %s\n", out_dir.c_str());
@@ -431,7 +738,7 @@ int wmain(int argc, wchar_t** argv) {
         std::string out_name =
             style.prefix + stem_of(blk.image) + style.suffix + ".psd";
         std::wstring out_path = wout_dir + L"\\" + utf8_to_wide(out_name);
-        if (build_psd(blk, wtxt_dir, out_path, style, layout, &err)) {
+        if (build_psd(blk, wtxt_dir, out_path, style, layout, wdebug_dir, &err)) {
             printf("OK   %s -> %s\n", blk.image.c_str(), out_name.c_str());
             ok++;
         } else {

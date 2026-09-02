@@ -36,3 +36,7 @@ bool render_text_preview(const std::wstring& font_name, double size_px,
                          int justification, double line_advance,
                          const std::vector<std::wstring>& lines,
                          std::vector<uint8_t>& rgba);
+
+// Saves an RGBA8 buffer as a PNG file (debug output, e.g. OCR overlays).
+bool save_image_png(const std::wstring& path, const std::vector<uint8_t>& rgba,
+                    int w, int h);

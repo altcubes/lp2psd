@@ -6,6 +6,37 @@
 
 #include "minijson.hpp"
 
+// OCR feature settings (config "ocr" node). Disabled by default; enabling
+// requires onnxruntime.dll + the detection model (see docs/ocr.md).
+struct OcrWhiten {
+    bool enabled = true;
+    uint8_t color[3] = {255, 255, 255};
+    int margin = 3;                // box expansion before painting, px
+    std::string layer_name = "whites";
+};
+
+// Outline layer of the detection boxes (top of the layer stack) for quickly
+// locating whitened regions in Photoshop. Disabled by default.
+struct OcrBoxes {
+    bool enabled = false;
+    uint8_t color[3] = {255, 0, 0};
+    std::string layer_name = "ocr_boxes";
+};
+
+struct OcrConfig {
+    bool enabled = false;
+    std::string model = "dbnet_detect.onnx";  // relative to the exe directory
+    int limit_side_len = 1024;  // long-side resize limit (detect input size)
+    double det_thresh = 0.5;    // sigmoid(db) binarization (dbBinThreshold)
+    double box_thresh = 0.7;    // drop lines with mean prob below this
+    double unclip_ratio = 2.3;  // DB unclip (area*ratio/perimeter)
+    double min_side = 3.0;      // drop lines with a model-grid side < this
+    double seg_thresh = 0.12;   // stroke-mask binarization threshold
+    int min_box_area = 64;
+    OcrWhiten whiten;
+    OcrBoxes boxes;
+};
+
 struct Style {
     std::wstring font_name = L"Microsoft YaHei";
     std::string font_ps = "MicrosoftYaHei";
@@ -30,6 +61,7 @@ struct Style {
     std::string output_dir;
     std::string prefix;
     std::string suffix;
+    OcrConfig ocr;
 };
 
 // Builds a Style from a parsed JSON config value (a bare `null` yields the
