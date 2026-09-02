@@ -9,9 +9,15 @@ JSON 不支持注释,本文档即字段说明。未写的字段取内置默认;�
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `dpi` | 数字或字符串 | `"original"` | 画布分辨率(像素/英寸)。`"original"`/`"auto"`/`"image"`/`"原图"`/`"自动"` = 使用原图内嵌 DPI(JPEG JFIF/EXIF,无则 96);数字(1~10000)= 所有图片统一用该分辨率。**影响字号换算**:EngineData 里字号 = pt × dpi ÷ 72,Photoshop 按 `pt = 值 × 72 ÷ dpi` 显示 |
-| `outputDir` | 字符串 | `""` | ⚠️ 目前**未使用**(解析但无效果)。输出目录由 `--out` 参数或默认规则(`<txt 所在目录>\output`)决定 |
-| `prefix` | 字符串 | `""` | 输出文件名前缀:输出 = `prefix + 图片名去扩展名 + suffix + ".psd"` |
-| `suffix` | 字符串 | `""` | 输出文件名后缀,同上 |
+| `bgCopy` | 对象 | 见下 | 可选:在 `bg` 图层正上方、`whites` 涂白图层下方生成一份原图拷贝图层(默认图层名 `bg 拷贝`),用于 PS 中对比/备份原图 |
+
+## `layers` — 图层不透明度与锁定
+
+作用于**所有生成图层**(背景 `bg`、`bg 拷贝`、涂白 `whites`、检测框 `dbnet_boxes` 与文本图层)。
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `opacity` | 数字 | `100` | 图层不透明度(%),范围 0~100。100 = 完全不透明。写入图层记录的不透明度字节(0~255)与 PS 图层面板一致。对 `whites` 图层会与 `whiten.transparency` 相乘(如 `layers.opacity: 50` + `transparency: 20` ⇒ 最终不透明度 40%) |
 
 ## `font` — 文字样式
 
@@ -33,9 +39,9 @@ JSON 不支持注释,本文档即字段说明。未写的字段取内置默认;�
 | `standardVerticalRomanAlignment` | 布尔 | `true` | `true` | 标准垂直罗马对齐(仅竖排生效,EngineData /BaselineDirection) |
 | `script` | 字符串或数字 | `"auto"`(`-1`) | `"auto"` | EngineData FontSet Script:`"auto"`/`"自动"` = 按字体名推断(西文 0,简中 3,命中日/韩/繁体关键词取对应值);也可数字 `0` 罗马、`1` 日文、`2` 繁体中文、`3` 简体中文、`4` 韩文。Script 错误是 PS"字体需要重排"提示的来源之一,一般保持 auto |
 
-## `ocr` — 日文检测与自动涂白(可选)
+## `dbnet` — 日文检测与自动涂白(可选)
 
-需先运行 `scripts\setup_ocr.bat`(onnxruntime + 导出 DBNet 检测模型)获取依赖,见 [ocr.md](ocr.md);缺依赖时自动跳过,不影响生成。
+需先运行 `scripts\setup_dbnet.bat`(onnxruntime + 导出 DBNet 检测模型)获取依赖,见 [dbnet.md](dbnet.md);缺依赖时自动跳过,不影响生成。
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
@@ -50,15 +56,29 @@ JSON 不支持注释,本文档即字段说明。未写的字段取内置默认;�
 | `minBoxArea` | 数字 | `64` | 丢弃面积(像素²)小于此值的框,过滤小误检 |
 | `whiten.enabled` | 布尔 | `true` | 涂白图层开关(`enabled` 为 false 时无效果) |
 | `whiten.color` | `[R,G,B]` | `[255,255,255]` | 涂白填充颜色 |
-| `whiten.margin` | 数字 | `3` | 笔画遮罩外扩像素(盖住抗锯齿边缘)。涂白只覆盖笔画本身,不再整块填充 |
+| `whiten.margin` | 数字 | `3` | 笔画遮罩外扩像素(盖住抗锯齿边缘) |
+| `whiten.boxMarginX` | 数字 | `3` | 检测框**横向**外扩像素(图像 x 轴),与 `dbnet_boxes` 描边共用同一外扩;`limitToBoxes` 开启时涂白横向最多延伸到此处 |
+| `whiten.boxMarginY` | 数字 | `3` | 检测框**竖向**外扩像素(图像 y 轴),与 `dbnet_boxes` 描边共用同一外扩;`limitToBoxes` 开启时涂白竖向最多延伸到此处 |
+| `whiten.limitToBoxes` | 布尔 | `true` | `true`(默认):涂白 = (mask 按 `margin` 外扩) ∩ (检测框按 `boxMarginX`/`boxMarginY` 外扩),框外涂白为 0。`false`:旧方案,全 mask 按 `margin` 外扩,不限制在框内 |
 | `whiten.layerName` | 字符串 | `"whites"` | 涂白图层名(图层紧贴原图层之上) |
+| `whiten.transparency` | 数字 | `0` | 涂白图层的透明程度(%),范围 0~100。0 = 完全不透明,100 = 完全透明(等价于图层不透明度 = 100 − transparency)。与 `layers.opacity` 相乘生效 |
+
+`limitToBoxes` 下,被 `dbBoxThreshold`/`minBoxArea` 过滤掉(无框)的弱文字 mask 区域不再涂白——若想保留弱文字,优先下调这两个框阈值,而不是直接关闭 `limitToBoxes`。`--debug-dbnet` 会额外输出 `<图片名>_whiten.png`(白 = 最终涂白像素)便于目检。
 | `boxes.enabled` | 布尔 | `false` | 检测框描边图层开关:在图层栈**最顶部**生成 1px 红框透明图层,按旋转四边形描边,标记每处涂白位置 |
 | `boxes.color` | `[R,G,B]` | `[255,0,0]` | 描边颜色 |
-| `boxes.layerName` | 字符串 | `"ocr_boxes"` | 描边图层名 |
+| `boxes.layerName` | 字符串 | `"dbnet_boxes"` | 描边图层名 |
+| `boxes.lock` | 布尔 | `false` | **仅对** `dbnet_boxes` 图层生效:为 `true` 时锁定全部(透明像素 + 图像像素 + 位置,`lspf = 0x07`,PS"锁定全部"),防止误编辑 |
+
+## `bgCopy` — 背景拷贝图层(可选)
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `enabled` | 布尔 | `false` | 是否生成 `bg` 的拷贝图层 |
+| `layerName` | 字符串 | `"bg 拷贝"` | 拷贝图层名(位于 `bg` 之上、`whites` 之下,与 `bg` 像素完全一致) |
 
 旧字段:`detThresh` 仍作为 `dbBinThreshold` 的别名读取;`unclipPx`(固定像素膨胀)已由 `dbUnclipRatio`(比例膨胀)取代,不再读取。
 
-调试:`--debug-ocr <目录>` 输出 `<图片名>_ocr.png`(绿=笔画遮罩、红=四边形)与 `<图片名>_mask.png`、`<图片名>_quads.json`,用于核查涂白位置(详见 [ocr.md](ocr.md))。
+调试:`--debug-dbnet <目录>` 输出 `<图片名>_dbnet.png`(绿=笔画遮罩、红=四边形)与 `<图片名>_mask.png`、`<图片名>_quads.json`,用于核查涂白位置(详见 [dbnet.md](dbnet.md))。
 
 ## 生成结果对照
 
@@ -68,5 +88,6 @@ JSON 不支持注释,本文档即字段说明。未写的字段取内置默认;�
 |---|---|
 | `dpi` | 图像资源 0x03ED(画布分辨率)+ EngineData 字号/行距换算 |
 | `font.*` | 文本图层 TySh / EngineData(字体、字号、颜色、对齐、行距、连字、Script)与涂白预览渲染 |
-| `prefix`/`suffix` | 输出文件名 |
-| `ocr.*` | `whites` 涂白图层与可选 `ocr_boxes` 描边图层 |
+| `dbnet.*` | `whites` 涂白图层与可选 `dbnet_boxes` 描边图层 |
+| `bgCopy.*` | 可选的 `bg 拷贝` 图层 |
+| `layers.*` | 每个图层记录的不透明度字节、flags 位与 `lspf` 保护设置块 |

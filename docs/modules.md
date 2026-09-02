@@ -11,7 +11,7 @@
 3. **配置定位**(:377-392):`--config` 优先;否则找 exe 同目录 `config.json`;都不存在则写出模板 `write_template_config`(:72,UTF-8 无 BOM)再读——即"首次运行生成模板"。
 4. **解析**:`parse_layout` → `load_style`(minijson 解析失败直接退出码 1)。
 5. **输出目录**:默认 `<txt 目录>\output`,`CreateDirectoryW` 自动创建(:416-419)。
-6. **逐图片块生成**(:430-440):文件名 = `<prefix><stem><suffix>.psd`;单个失败只打印 FAIL,不影响后续;全部成功返回 0 并打开 Explorer,否则返回 1。
+6. **逐图片块生成**(:430-440):文件名 = `<stem>.psd`;单个失败只打印 FAIL,不影响后续;全部成功返回 0 并打开 Explorer,否则返回 1。
 
 ### make_text_layer(:157)— 一个 TextEntry → 一个文本图层
 
@@ -33,10 +33,10 @@
 - 底层 `bg` 像素图层(整幅图)。
 - **分组堆叠顺序**(:301-322):分组号按"映射顺序优先、条目出现顺序补充"收集到 `gnums`,然后**逆序**压入 `doc.layers`(模型是 bottom-to-top),因此分组映射表中先出现的组在 PS 里位于上层。组名为空映射时用 `"Group N"` 兜底(:112)。
 - `group <= 0` 的条目不进组,直接放顶层(:325-329)。
-- **OCR 集成**:OCR 检测在 `build_psd` 开头(`style.ocr.enabled` 时调 `ocr_detect`,失败打印警告继续),随后:
-  - `make_whiten_layer`:把逐像素笔画遮罩 `stroke_mask` 外扩 `whiten.margin` 后合成一个白色像素图层,插入 `bg` 之上(图层栈 index 1);只覆盖笔画本身,不再整块填充;
-  - `make_box_outline_layer`:可选(`ocr.boxes.enabled`)在图层栈**最顶部**按旋转四边形(外扩 margin)生成 1px 描边透明图层,标记每处涂白位置;
-  - `--debug-ocr <dir>`:`save_ocr_debug` + `image.cpp` 的 `save_image_png` 输出调试图 `<图片名>_ocr.png`(绿=笔画遮罩、红=四边形)+ `_mask.png` + `_quads.json`。
+- **dbnet 集成**:dbnet 检测在 `build_psd` 开头(`style.dbnet.enabled` 时调 `dbnet_detect`,失败打印警告继续),随后:
+  - `make_whiten_layer`:默认(`whiten.limitToBoxes=true`)把笔画遮罩按 `whiten.margin` 外扩(`dilate_binary`,滑动窗口 O(n)),再与按 `whiten.boxMarginX`/`boxMarginY` 外扩的检测框栅格化区域取交集,合成白色像素图层,插入 `bg` 之上;框外涂白为 0。`false` 时走旧分支(全 mask 按 `margin` 外扩,无框限制);
+  - `make_box_outline_layer`:可选(`dbnet.boxes.enabled`)在图层栈**最顶部**按旋转四边形(外扩 `whiten.boxMarginX`/`boxMarginY`)生成 1px 描边透明图层,与交集允许区域共用同一外扩;
+  - `--debug-dbnet <dir>`:`save_dbnet_debug` + `image.cpp` 的 `save_image_png` 输出调试图 `<图片名>_dbnet.png`(绿=笔画遮罩、红=四边形)+ `_mask.png` + `_quads.json`;新方案另输出 `_whiten.png`(最终涂白区域)并在控制台打印 mask→外扩→框内交集统计。
 
 ## layout.cpp / layout.hpp — LabelPlus txt 解析
 
@@ -77,16 +77,15 @@
 - **字号** `parse_font_size`(:85):接受数字或数字字符串,合法范围 (0, 10000)。
 - **枚举解析**均接受数字或名称(含中文):`parse_anti_alias`(:107)、`parse_orientation`(:120)、`parse_justification`(:129)、`parse_script`(:70,`auto`/`自动` → -1 表示按字体名自动判断)。
 - **DPI**(:180-191):数字且 ∈ [1, 10000] 为固定 DPI;字符串 `original`/`auto`/`image`/`原图`/`自动` → 0(跟随图片)。
-- `outputDir`/`prefix`/`suffix`(:192-194)读入 Style;**`outputDir` 目前没有消费者**(输出目录只由 `--out` / 默认规则决定),`prefix`/`suffix` 在 main.cpp:431 使用。
-- **OcrConfig**(style.hpp):`ocr.enabled`(默认 false)、`model`、`limitSideLen`/`dbBinThreshold`/`dbBoxThreshold`/`dbUnclipRatio`/`minSide`/`segThreshold`/`minBoxArea`(推理参数)、`whiten`(颜色/边距/图层名)、`boxes`(描边图层颜色/图层名)。解析在 `load_style` 末尾,字段名 camelCase 与 config 对应;`detThresh` 作为 `dbBinThreshold` 的旧别名兼容。
+- **dbnetConfig**(style.hpp):`dbnet.enabled`(默认 false)、`model`、`limitSideLen`/`dbBinThreshold`/`dbBoxThreshold`/`dbUnclipRatio`/`minSide`/`segThreshold`/`minBoxArea`(推理参数)、`whiten`(颜色/边距/图层名/透明度)、`boxes`(描边图层颜色/图层名/全锁)。另有顶层 `bgCopy`(可选 `bg 拷贝` 图层)。解析在 `load_style` 末尾,字段名 camelCase 与 config 对应;`detThresh` 作为 `dbBinThreshold` 的旧别名兼容。
 
-## ocr.cpp / ocr.hpp — 可选 OCR 检测(编译开关 `LP2PSD_WITH_OCR`)
+## dbnet.cpp / dbnet.hpp — 可选 dbnet 检测(编译开关 `LP2PSD_WITH_dbnet`)
 
-用 ONNX Runtime(C API,`LoadLibraryW("onnxruntime.dll")` 动态加载,**不链接 .lib**)+ m-i-t DBNet 检测模型(ONNX,与 yakuyomi-engine 同款检测器)做日文文本区域检测,输出旋转四边形 + 逐像素笔画遮罩(供涂白图层)。头文件在未定义宏时提供内联桩(`ocr_available()` 恒 false),调用方无需条件编译。管线与依赖安装见 [ocr.md](ocr.md)。
+用 ONNX Runtime(C API,`LoadLibraryW("onnxruntime.dll")` 动态加载,**不链接 .lib**)+ m-i-t DBNet 检测模型(ONNX,与 yakuyomi-engine 同款检测器)做日文文本区域检测,输出旋转四边形 + 逐像素笔画遮罩(供涂白图层)。头文件在未定义宏时提供内联桩(`dbnet_available()` 恒 false),调用方无需条件编译。管线与依赖安装见 [dbnet.md](dbnet.md)。
 
 - `load_runtime`:`GetProcAddress("OrtGetApiBase")` → `GetApi(ORT_API_VERSION)`,结果缓存。
 - `ensure_session`:模型存在性检查;`OrtSession` 按进程缓存,同一模型只加载一次。
-- `ocr_detect`:双线性 RGBA 缩放(长边 = `limit_side_len`)→ pad 到 256 倍数(黑)→ RGB 归一化 (x/127.5-1)→ `OrtApi::Run`(in0 → out0 db / out1 mask)→ sigmoid(ch0) 二值化(`det_thresh`)→ 8 连通 BFS 连通域收集边界点 → 凸包旋转卡尺 `min_area_rect` → DB unclip(`unclip_ratio`)→ 旋转四边形映射回原图坐标 → `min_box_area`/`min_side` 过滤;mask 裁有效区 → 双线性放大回原图 → `seg_thresh` 阈值 → 笔画遮罩。后处理与 yakuyomi-engine `Detector.kt` 逐行一致。
+- `dbnet_detect`:双线性 RGBA 缩放(长边 = `limit_side_len`)→ pad 到 256 倍数(黑)→ RGB 归一化 (x/127.5-1)→ `OrtApi::Run`(in0 → out0 db / out1 mask)→ sigmoid(ch0) 二值化(`det_thresh`)→ 8 连通 BFS 连通域收集边界点 → 凸包旋转卡尺 `min_area_rect` → DB unclip(`unclip_ratio`)→ 旋转四边形映射回原图坐标 → `min_box_area`/`min_side` 过滤;mask 裁有效区 → 双线性放大回原图 → `seg_thresh` 阈值 → 笔画遮罩。后处理与 yakuyomi-engine `Detector.kt` 逐行一致。
 
 ## image.cpp / image.hpp — GDI+ 图像与文本预览
 
@@ -98,7 +97,7 @@
   - **竖排**(:154-166):每行一列,列宽 `size_px * 1.35`,从右往左排(`x0 = w - (i+1)*col_w`),`StringFormatFlagsDirectionVertical`;与 Photoshop 竖排行为一致。
   - **横排**(:167-178):按 justification 左/中/右定位(仅 1、2 生效),行高 `line_advance`。
   - 颜色 BRGA 翻转与 load_image 相同(:189-197)。
-- `save_image_png`:RGBA8 → PNG(`GetImageEncoders` 找 PNG CLSID),OCR 调试图输出用。
+- `save_image_png`:RGBA8 → PNG(`GetImageEncoders` 找 PNG CLSID),dbnet 调试图输出用。
 
 预览栅格有两个用途:① 写入 PSD 作为文本图层的合成像素,让任何查看器(不解析 EngineData 的)都能显示文字;② 扫描出 ink bbox 供 TySh `boundingBox` 用。
 

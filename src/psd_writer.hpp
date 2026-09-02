@@ -148,6 +148,14 @@ struct LayerBase {
     std::string name;
     int top = 0, left = 0, bottom = 0, right = 0;
     bool visible = true;
+    // Layer opacity, 0-255 (255 = fully opaque, 0 = fully transparent).
+    uint8_t opacity = 255;
+    // Lock state. transparency_locked also sets the legacy layer-flags bit;
+    // all three map to the lspf protected-settings bitmask
+    // (1 = transparency, 2 = composite/edit, 4 = position).
+    bool transparency_locked = false;
+    bool composite_locked = false;
+    bool position_locked = false;
     Effects effects;
 };
 

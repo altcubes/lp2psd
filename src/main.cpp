@@ -30,9 +30,10 @@
 #include "image.hpp"
 #include "layout.hpp"
 #include "minijson.hpp"
-#include "ocr.hpp"
+#include "dbnet.hpp"
 #include "psd_writer.hpp"
 #include "style.hpp"
+#include "textmetrics.hpp"
 #include "textcodec.hpp"
 
 #pragma comment(lib, "comdlg32.lib")
@@ -75,9 +76,6 @@ bool write_template_config(const std::wstring& path) {
     const char templ[] =
         "{\n"
         "  \"dpi\": \"original\",\n"
-        "  \"outputDir\": \"\",\n"
-        "  \"prefix\": \"\",\n"
-        "  \"suffix\": \"\",\n"
         "  \"font\": {\n"
         "    \"name\": \"Microsoft YaHei\",\n"
         "    \"postScript\": \"\",\n"
@@ -93,7 +91,7 @@ bool write_template_config(const std::wstring& path) {
         "    \"standardVerticalRomanAlignment\": true,\n"
         "    \"script\": \"auto\"\n"
         "  },\n"
-        "  \"ocr\": {\n"
+        "  \"dbnet\": {\n"
         "    \"enabled\": false,\n"
         "    \"model\": \"dbnet_detect.onnx\",\n"
         "    \"limitSideLen\": 1024,\n"
@@ -107,13 +105,25 @@ bool write_template_config(const std::wstring& path) {
         "      \"enabled\": true,\n"
         "      \"color\": [255, 255, 255],\n"
         "      \"margin\": 3,\n"
-        "      \"layerName\": \"whites\"\n"
+        "      \"boxMarginX\": 3,\n"
+        "      \"boxMarginY\": 3,\n"
+        "      \"limitToBoxes\": true,\n"
+        "      \"layerName\": \"whites\",\n"
+        "      \"transparency\": 0\n"
         "    },\n"
         "    \"boxes\": {\n"
         "      \"enabled\": false,\n"
         "      \"color\": [255, 0, 0],\n"
-        "      \"layerName\": \"ocr_boxes\"\n"
+        "      \"layerName\": \"dbnet_boxes\",\n"
+        "      \"lock\": true\n"
         "    }\n"
+        "  },\n"
+        "  \"bgCopy\": {\n"
+        "    \"enabled\": false,\n"
+        "    \"layerName\": \"bg 拷贝\"\n"
+        "  },\n"
+        "  \"layers\": {\n"
+        "    \"opacity\": 100\n"
         "  }\n"
         "}\n";
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
@@ -167,42 +177,126 @@ std::vector<std::string> split_escaped_lines(const std::string& line) {
     return out;
 }
 
-// Rough text width estimation (CJK glyphs = 1.0 em, Latin = 0.55 em).
-double line_units(const std::string& line) {
-    double units = 0;
-    size_t i = 0;
-    while (i < line.size()) {
-        uint8_t c = (uint8_t)line[i];
-        if (c < 0x80) {
-            units += 0.55;
-            i++;
-        } else if ((c & 0xE0) == 0xC0) i += 2, units += 0.55;
-        else if ((c & 0xF0) == 0xE0) i += 3, units += 1.0;
-        else i += 4, units += 1.0;
+// ===========================================================================
+// dbnet-based whitening and font-size matching
+// ===========================================================================
+
+// Expands a quad about its centroid along the image axes: `pad_x` moves each
+// vertex outward horizontally (x), `pad_y` vertically (y). For axis-aligned
+// boxes this grows the width by 2*pad_x and the height by 2*pad_y; rotated
+// quads keep their orientation while the vertices move along x/y.
+void expand_quad(const double* quad, int pad_x, int pad_y, double out[8]) {
+    double cx = 0, cy = 0;
+    for (int k = 0; k < 4; k++) { cx += quad[k * 2]; cy += quad[k * 2 + 1]; }
+    cx /= 4; cy /= 4;
+    for (int k = 0; k < 4; k++) {
+        double dx = quad[k * 2] - cx, dy = quad[k * 2 + 1] - cy;
+        double sx = dx > 0 ? 1.0 : (dx < 0 ? -1.0 : 0.0);
+        double sy = dy > 0 ? 1.0 : (dy < 0 ? -1.0 : 0.0);
+        out[k * 2] = quad[k * 2] + sx * pad_x;
+        out[k * 2 + 1] = quad[k * 2 + 1] + sy * pad_y;
     }
-    return units;
 }
 
-// ===========================================================================
-// OCR-based whitening and font-size matching
-// ===========================================================================
+// Statistics for the box-limited whitening scheme (see make_whiten_layer).
+struct WhitenStats {
+    size_t mask_px = 0;     // stroke pixels
+    size_t dilated_px = 0;  // after margin dilation
+    size_t final_px = 0;    // after intersection with expanded boxes
+};
 
-// Builds one pixel layer covering all detected text strokes: the per-pixel
-// stroke mask dilated by cfg.margin (to swallow anti-aliasing edges), filled
-// with opaque pixels. Returns null when there is nothing to draw.
-std::shared_ptr<psdw::PixelLayer> make_whiten_layer(
-    const std::vector<uint8_t>& stroke_mask, int iw, int ih,
-    const OcrWhiten& cfg) {
-    if (stroke_mask.size() != (size_t)iw * ih) return nullptr;
+// Rasterizes the quads (each expanded by pad_x/pad_y about its centroid)
+// into a binary "inside any box" mask via even-odd scanline fill. Uses the
+// same expansion as make_box_outline_layer, so the outlines and the allowed
+// whitening area always agree.
+void rasterize_quads(const std::vector<dbnetBox>& boxes, int iw, int ih,
+                     int pad_x, int pad_y, std::vector<uint8_t>& out) {
+    out.assign((size_t)iw * ih, 0);
+    for (const auto& box : boxes) {
+        double q[8];
+        expand_quad(box.quad, pad_x, pad_y, q);
+        // double min_y = std::floor(q[1]), max_y = std::ceil(q[7]);
+        // for (int k = 1; k < 4; k++) {
+        //     min_y = std::min(min_y, std::floor(q[k * 2 + 1]));
+        //     max_y = std::max(max_y, std::ceil(q[k * 2 + 1]));
+        // }
+        double min_y = q[1], max_y = q[1];
+        for (int k = 1; k < 4; k++) {
+            min_y = std::min(min_y, q[k * 2 + 1]);
+            max_y = std::max(max_y, q[k * 2 + 1]);
+        }
+        min_y = std::floor(min_y);
+        max_y = std::ceil(max_y);
+        for (int y = std::max(0, (int)min_y);
+             y <= std::min(ih - 1, (int)max_y); y++) {
+            double spans[4];
+            int n = 0;
+            for (int k = 0; k < 4; k++) {
+                int k2 = (k + 1) % 4;
+                double y0 = q[k * 2 + 1], y1 = q[k2 * 2 + 1];
+                if ((y0 <= y && y1 > y) || (y1 <= y && y0 > y)) {
+                    double x0 = q[k * 2], x1 = q[k2 * 2];
+                    spans[n++] = x0 + (y - y0) * (x1 - x0) / (y1 - y0);
+                }
+            }
+            if (n < 2) continue;
+            std::sort(spans, spans + n);
+            uint8_t* row = out.data() + (size_t)y * iw;
+            for (int i = 0; i + 1 < n; i += 2) {
+                int x0 = std::max(0, (int)std::ceil(spans[i]));
+                int x1 = std::min(iw, (int)std::ceil(spans[i + 1]));
+                for (int x = x0; x < x1; x++) row[x] = 1;
+            }
+        }
+    }
+}
+
+// Binary dilation by a square of radius r, via separable sliding windows
+// (O(w*h), pixel-identical to the per-pixel box fill used by the legacy
+// whitening path).
+std::vector<uint8_t> dilate_binary(const std::vector<uint8_t>& src, int w,
+                                   int h, int r) {
+    if (r <= 0) return src;
+    std::vector<uint8_t> hd((size_t)w * h, 0);
+    for (int y = 0; y < h; y++) {
+        const uint8_t* row = &src[(size_t)y * w];
+        uint8_t* out = &hd[(size_t)y * w];
+        int sum = 0;
+        // Window for x is [x-r, x+r]; the left edge is clipped for x < r.
+        for (int x = 0; x < w && x <= r; x++) sum += row[x];
+        for (int x = 0; x < w; x++) {
+            out[x] = sum > 0 ? 1 : 0;
+            if (x - r >= 0) sum -= row[x - r];
+            if (x + r + 1 < w) sum += row[x + r + 1];
+        }
+    }
+    std::vector<uint8_t> out((size_t)w * h, 0);
+    for (int x = 0; x < w; x++) {
+        int sum = 0;
+        for (int y = 0; y < h && y <= r; y++) sum += hd[(size_t)y * w + x];
+        for (int y = 0; y < h; y++) {
+            out[(size_t)y * w + x] = sum > 0 ? 1 : 0;
+            if (y - r >= 0) sum -= hd[(size_t)(y - r) * w + x];
+            if (y + r + 1 < h) sum += hd[(size_t)(y + r + 1) * w + x];
+        }
+    }
+    return out;
+}
+
+// Builds one pixel layer from a binary region (1 = paint): tight layer
+// bounds plus opaque runs of cfg.color. Returns null when region is empty.
+std::shared_ptr<psdw::PixelLayer> make_layer_from_region(
+    const std::vector<uint8_t>& region, int iw, int ih,
+    const dbnetWhiten& cfg) {
     int l = iw, t = ih, r = 0, b = 0;
     for (int y = 0; y < ih; y++) {
-        const uint8_t* row = &stroke_mask[(size_t)y * iw];
+        const uint8_t* row = &region[(size_t)y * iw];
         for (int x = 0; x < iw; x++) {
             if (!row[x]) continue;
-            l = std::min(l, std::max(0, x - cfg.margin));
-            t = std::min(t, std::max(0, y - cfg.margin));
-            r = std::max(r, std::min(iw, x + cfg.margin + 1));
-            b = std::max(b, std::min(ih, y + cfg.margin + 1));
+            l = std::min(l, x);
+            t = std::min(t, y);
+            r = std::max(r, x + 1);
+            b = std::max(b, y + 1);
         }
     }
     if (r <= l || b <= t) return nullptr;
@@ -212,38 +306,111 @@ std::shared_ptr<psdw::PixelLayer> make_whiten_layer(
     pl->x = l; pl->y = t;
     pl->w = r - l; pl->h = b - t;
     pl->rgba.assign((size_t)pl->w * pl->h * 4, 0);  // transparent
-    const int m = std::max(0, cfg.margin);
-    for (int y = 0; y < ih; y++) {
-        const uint8_t* row = &stroke_mask[(size_t)y * iw];
-        for (int x = 0; x < iw; x++) {
-            if (!row[x]) continue;
-            int x0 = std::max(l, x - m), x1 = std::min(r, x + m + 1);
-            int y0 = std::max(t, y - m), y1 = std::min(b, y + m + 1);
-            for (int yy = y0; yy < y1; yy++) {
-                uint8_t* p = pl->rgba.data() +
-                             ((size_t)(yy - t) * pl->w + (x0 - l)) * 4;
-                for (int xx = x0; xx < x1; xx++) {
-                    p[0] = cfg.color[0]; p[1] = cfg.color[1];
-                    p[2] = cfg.color[2]; p[3] = 255;
-                    p += 4;
-                }
+    for (int y = t; y < b; y++) {
+        const uint8_t* row = &region[(size_t)y * iw];
+        int x = l;
+        while (x < r) {
+            if (!row[x]) { x++; continue; }
+            int x1 = x;
+            while (x1 < r && row[x1]) x1++;
+            uint8_t* p = pl->rgba.data() +
+                         ((size_t)(y - t) * pl->w + (x - l)) * 4;
+            for (int xx = x; xx < x1; xx++) {
+                p[0] = cfg.color[0]; p[1] = cfg.color[1];
+                p[2] = cfg.color[2]; p[3] = 255;
+                p += 4;
             }
+            x = x1;
         }
     }
     return pl;
 }
 
-// Expands a quad uniformly by `pad` pixels about its centroid.
-void expand_quad(const double* quad, int pad, double out[8]) {
-    double cx = 0, cy = 0;
-    for (int k = 0; k < 4; k++) { cx += quad[k * 2]; cy += quad[k * 2 + 1]; }
-    cx /= 4; cy /= 4;
-    for (int k = 0; k < 4; k++) {
-        double dx = quad[k * 2] - cx, dy = quad[k * 2 + 1] - cy;
-        double len = std::max(1.0, std::hypot(dx, dy));
-        out[k * 2] = quad[k * 2] + dx / len * pad;
-        out[k * 2 + 1] = quad[k * 2 + 1] + dy / len * pad;
+// Builds the whitening pixel layer.
+//
+// limit_to_boxes = true (default): every stroke pixel is dilated by
+// cfg.margin, then the result is intersected with the detection quads
+// expanded by cfg.box_margin_x/cfg.box_margin_y. Whitening therefore never
+// leaves the dbnet_boxes outlines, and margin keeps swallowing AA edges.
+// limit_to_boxes = false: legacy behavior - the whole stroke mask is
+// dilated by cfg.margin with no box restriction.
+//
+// `final_mask_out` receives the final binary region (1 = painted) and
+// `stats_out` the pixel counts, both for debug output/statistics.
+std::shared_ptr<psdw::PixelLayer> make_whiten_layer(
+    const std::vector<uint8_t>& stroke_mask, const std::vector<dbnetBox>& boxes,
+    int iw, int ih, const dbnetWhiten& cfg,
+    std::vector<uint8_t>* final_mask_out = nullptr,
+    WhitenStats* stats_out = nullptr) {
+    if (stroke_mask.size() != (size_t)iw * ih) return nullptr;
+
+    if (!cfg.limit_to_boxes) {
+        // Legacy scheme, kept intact for zero behavior change.
+        const int m = std::max(0, cfg.margin);
+        int l = iw, t = ih, r = 0, b = 0;
+        for (int y = 0; y < ih; y++) {
+            const uint8_t* row = &stroke_mask[(size_t)y * iw];
+            for (int x = 0; x < iw; x++) {
+                if (!row[x]) continue;
+                l = std::min(l, std::max(0, x - m));
+                t = std::min(t, std::max(0, y - m));
+                r = std::max(r, std::min(iw, x + m + 1));
+                b = std::max(b, std::min(ih, y + m + 1));
+            }
+        }
+        if (r <= l || b <= t) return nullptr;
+
+        auto pl = std::make_shared<psdw::PixelLayer>();
+        pl->name = cfg.layer_name;
+        pl->x = l; pl->y = t;
+        pl->w = r - l; pl->h = b - t;
+        pl->rgba.assign((size_t)pl->w * pl->h * 4, 0);  // transparent
+        for (int y = 0; y < ih; y++) {
+            const uint8_t* row = &stroke_mask[(size_t)y * iw];
+            for (int x = 0; x < iw; x++) {
+                if (!row[x]) continue;
+                int x0 = std::max(l, x - m), x1 = std::min(r, x + m + 1);
+                int y0 = std::max(t, y - m), y1 = std::min(b, y + m + 1);
+                for (int yy = y0; yy < y1; yy++) {
+                    uint8_t* p = pl->rgba.data() +
+                                 ((size_t)(yy - t) * pl->w + (x0 - l)) * 4;
+                    for (int xx = x0; xx < x1; xx++) {
+                        p[0] = cfg.color[0]; p[1] = cfg.color[1];
+                        p[2] = cfg.color[2]; p[3] = 255;
+                        p += 4;
+                    }
+                }
+            }
+        }
+        return pl;
     }
+
+    const int m = std::max(0, cfg.margin);
+    const int bm_x = std::max(0, cfg.box_margin_x);
+    const int bm_y = std::max(0, cfg.box_margin_y);
+    std::vector<uint8_t> dilated = dilate_binary(stroke_mask, iw, ih, m);
+    std::vector<uint8_t> allowed;
+    rasterize_quads(boxes, iw, ih, bm_x, bm_y, allowed);
+    std::vector<uint8_t> region((size_t)iw * ih, 0);
+    size_t final_px = 0;
+    for (size_t i = 0; i < region.size(); i++) {
+        if (dilated[i] && allowed[i]) {
+            region[i] = 1;
+            final_px++;
+        }
+    }
+    if (stats_out) {
+        size_t mask_px = 0, dilated_px = 0;
+        for (size_t i = 0; i < region.size(); i++) {
+            mask_px += stroke_mask[i];
+            dilated_px += dilated[i];
+        }
+        stats_out->mask_px = mask_px;
+        stats_out->dilated_px = dilated_px;
+        stats_out->final_px = final_px;
+    }
+    if (final_mask_out) *final_mask_out = region;
+    return make_layer_from_region(region, iw, ih, cfg);
 }
 
 // Draws a 1px line (Bresenham) into a pixel layer, clamped to its bounds.
@@ -267,16 +434,17 @@ void draw_layer_line(std::vector<uint8_t>& rgba, int lw, int lh, int ox, int oy,
 }
 
 // Builds a transparent layer with a 1px outline around every detection quad
-// (expanded by the same margin used for whitening, so it marks roughly where
-// white was painted). Intended for the top of the layer stack. Returns null
-// when there is nothing to draw.
+// (expanded by margin_x/margin_y, the whiten boxMarginX/boxMarginY in the new
+// scheme), so it marks exactly where the box-limited whitening may reach.
+// Intended for the top of the layer stack. Returns null when nothing to draw.
 std::shared_ptr<psdw::PixelLayer> make_box_outline_layer(
-    const std::vector<OcrBox>& boxes, int iw, int ih, int margin,
-    const OcrBoxes& cfg) {
+    const std::vector<dbnetBox>& boxes, int iw, int ih, int margin_x,
+    int margin_y,
+    const dbnetBoxes& cfg) {
     int l = iw, t = ih, r = 0, b = 0;
     for (const auto& box : boxes) {
         double q[8];
-        expand_quad(box.quad, margin, q);
+        expand_quad(box.quad, margin_x, margin_y, q);
         for (int k = 0; k < 4; k++) {
             l = std::min(l, (int)std::floor(q[k * 2]));
             t = std::min(t, (int)std::floor(q[k * 2 + 1]));
@@ -295,7 +463,7 @@ std::shared_ptr<psdw::PixelLayer> make_box_outline_layer(
     pl->rgba.assign((size_t)pl->w * pl->h * 4, 0);  // transparent
     for (const auto& box : boxes) {
         double q[8];
-        expand_quad(box.quad, margin, q);
+        expand_quad(box.quad, margin_x, margin_y, q);
         for (int k = 0; k < 4; k++) {
             int k2 = (k + 1) % 4;
             draw_layer_line(pl->rgba, pl->w, pl->h, l, t,
@@ -323,10 +491,26 @@ void draw_quad_outline(std::vector<uint8_t>& img, int iw, int ih,
     }
 }
 
-// Saves "<image stem>_ocr.png" with the stroke mask (green) and the rotated
+// Saves a binary mask (1 = set) as a grayscale PNG "<stem><suffix>.png".
+void save_mask_png(const std::wstring& debug_dir, const std::string& stem,
+                   const char* suffix, const std::vector<uint8_t>& mask,
+                   int iw, int ih) {
+    if (mask.size() != (size_t)iw * ih) return;
+    std::vector<uint8_t> rgba(mask.size() * 4, 0);
+    for (size_t i = 0; i < mask.size(); i++) {
+        uint8_t v = mask[i] ? 255 : 0;
+        uint8_t* p = &rgba[i * 4];
+        p[0] = v; p[1] = v; p[2] = v; p[3] = 255;
+    }
+    save_image_png(debug_dir + L"\\" + utf8_to_wide(stem) +
+                       utf8_to_wide(suffix) + L".png",
+                   rgba, iw, ih);
+}
+
+// Saves "<image stem>_dbnet.png" with the stroke mask (green) and the rotated
 // detection quads (red) drawn, into debug_dir.
-void save_ocr_debug(const std::vector<uint8_t>& img, int iw, int ih,
-                    const std::vector<OcrBox>& boxes,
+void save_dbnet_debug(const std::vector<uint8_t>& img, int iw, int ih,
+                    const std::vector<dbnetBox>& boxes,
                     const std::vector<uint8_t>& stroke_mask,
                     const std::wstring& debug_dir, const std::string& stem) {
     std::vector<uint8_t> overlay = img;
@@ -341,19 +525,13 @@ void save_ocr_debug(const std::vector<uint8_t>& img, int iw, int ih,
     }
     for (const auto& box : boxes)
         draw_quad_outline(overlay, iw, ih, box.quad, 255, 0, 0);
-    save_image_png(debug_dir + L"\\" + utf8_to_wide(stem) + L"_ocr.png",
+    save_image_png(debug_dir + L"\\" + utf8_to_wide(stem) + L"_dbnet.png",
                    overlay, iw, ih);
 
     // Grayscale stroke mask + machine-readable quads, for parity checking
     // against scripts/parity_detect.py.
-    std::vector<uint8_t> mask_rgba(stroke_mask.size() * 4, 0);
-    for (size_t i = 0; i < stroke_mask.size(); i++) {
-        uint8_t v = stroke_mask[i] ? 255 : 0;
-        uint8_t* p = &mask_rgba[i * 4];
-        p[0] = v; p[1] = v; p[2] = v; p[3] = 255;
-    }
-    save_image_png(debug_dir + L"\\" + utf8_to_wide(stem) + L"_mask.png",
-                   mask_rgba, iw, ih);
+    if (stroke_mask.size() == (size_t)iw * ih)
+        save_mask_png(debug_dir, stem, "_mask", stroke_mask, iw, ih);
 
     std::string js = "{\"boxes\":[";
     for (size_t i = 0; i < boxes.size(); i++) {
@@ -384,6 +562,57 @@ void save_ocr_debug(const std::vector<uint8_t>& img, int iw, int ih,
     }
 }
 
+// Applies the config "layers" section (opacity) to a layer.
+void apply_layer_settings(psdw::LayerBase* l, const Style& style) {
+    if (!l) return;
+    l->opacity = (uint8_t)std::llround(style.layers.opacity * 255.0 / 100.0);
+}
+
+// Full lock: protects transparent pixels, image pixels and position
+// (lspf = 0x07, Photoshop "Lock all").
+void apply_full_lock(psdw::LayerBase* l) {
+    if (!l) return;
+    l->transparency_locked = true;
+    l->composite_locked = true;
+    l->position_locked = true;
+}
+
+// Renders the raster preview for a text layer and measures its ink box
+// (relative to the layer box top-left). Leaves the preview empty on failure.
+void render_text_preview_and_ink(psdw::TextLayer& tl,
+                                 const std::vector<std::string>& lines,
+                                 double font_size_px, int pw, int ph,
+                                 const Style& style, double leading_px) {
+    if (pw <= 0 || ph <= 0) return;
+    std::vector<std::wstring> wlines;
+    for (const auto& ln : lines) wlines.push_back(utf8_to_wide(ln));
+    std::vector<uint8_t> prev;
+    if (!render_text_preview(style.font_name, font_size_px, pw, ph,
+                             style.color, style.orientation,
+                             style.justification, leading_px, wlines, prev))
+        return;
+    tl.text.preview = std::move(prev);
+
+    // Ink bounding box of the rendered glyphs, relative to the box.
+    int il = pw, it = ph, ir = -1, ib = -1;
+    for (int py = 0; py < ph; py++) {
+        for (int px_ = 0; px_ < pw; px_++) {
+            if (tl.text.preview[((size_t)py * pw + px_) * 4 + 3] > 8) {
+                il = std::min(il, px_);
+                it = std::min(it, py);
+                ir = std::max(ir, px_);
+                ib = std::max(ib, py);
+            }
+        }
+    }
+    if (ir >= il && ib >= it) {
+        tl.text.ink_l = il;
+        tl.text.ink_t = it;
+        tl.text.ink_r = ir + 1;
+        tl.text.ink_b = ib + 1;
+    }
+}
+
 std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
                                                  int ih, double font_size,
                                                  const Style& style,
@@ -395,11 +624,9 @@ std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
         lines.insert(lines.end(), parts.begin(), parts.end());
     }
     std::string text;
-    double max_units = 1.0;
     for (size_t i = 0; i < lines.size(); i++) {
         if (i) text += '\n';
         text += lines[i];
-        max_units = std::max(max_units, line_units(lines[i]));
     }
     if (text.empty()) return nullptr;
 
@@ -414,21 +641,12 @@ std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
     double leading_px = (style.auto_leading ? font_size * style.auto_leading_size
                                             : (style.leading > 0.0 ? style.leading
                                                                    : font_size * style.auto_leading_size)) * px_scale;
-    // Longest line in UTF-16 code units (vertical columns stack glyphs).
-    int max_chars = 1;
-    for (const auto& ln : lines)
-        max_chars = std::max(max_chars, (int)utf8_to_wide(ln).size());
-    double box_w, box_h;
-    if (style.orientation == 1) {
-        // vertical: each line is a column, columns advance right-to-left
-        // Vertical: one em column per line, columns advance right-to-left;
-        // column height = glyph count * font size (real PS behavior).
-        box_w = std::max((double)lines.size() * font_size_px * 1.35, font_size_px * 1.35);
-        box_h = std::max((double)max_chars * font_size_px, font_size_px);
-    } else {
-        box_w = std::max(max_units * font_size_px, font_size_px);
-        box_h = std::max((double)lines.size() * leading_px, leading_px);
-    }
+    // Shared with psd_writer.cpp (TySh em bounds) so layer geometry and the
+    // text engine stay in agreement.
+    textmetrics::Box box =
+        textmetrics::estimate_box(lines, style.orientation, font_size_px,
+                                  leading_px);
+    const double box_w = box.w, box_h = box.h;
 
     tl->name = lines[0].substr(0, 60);
     tl->text.text = text;
@@ -451,6 +669,7 @@ std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
     tl->text.standard_vertical_roman = style.standard_vertical_roman;
     tl->text.script = style.script;
     tl->text.dpi = dpi;
+    apply_layer_settings(tl.get(), style);
 
     // Layer geometry must match the record rectangle exactly:
     // w = round(x+w) - round(x)
@@ -460,36 +679,124 @@ std::shared_ptr<psdw::TextLayer> make_text_layer(const TextEntry& e, int iw,
     tl->bottom = (int)std::llround(y + box_h);
     int pw = tl->right - tl->left;
     int ph = tl->bottom - tl->top;
-    if (pw > 0 && ph > 0) {
-        std::vector<std::wstring> wlines;
-        for (const auto& ln : lines) wlines.push_back(utf8_to_wide(ln));
-        std::vector<uint8_t> prev;
-        if (render_text_preview(style.font_name, font_size_px, pw, ph, style.color,
-                                style.orientation, style.justification, leading_px,
-                                wlines, prev)) {
-            tl->text.preview = std::move(prev);
-            // Ink bounding box of the rendered glyphs, relative to the box.
-            int il = pw, it = ph, ir = -1, ib = -1;
-            for (int py = 0; py < ph; py++) {
-                for (int px_ = 0; px_ < pw; px_++) {
-                    if (tl->text.preview[((size_t)py * pw + px_) * 4 + 3] > 8) {
-                        il = std::min(il, px_);
-                        it = std::min(it, py);
-                        ir = std::max(ir, px_);
-                        ib = std::max(ib, py);
-                    }
-                }
-            }
-            if (ir >= il && ib >= it) {
-                tl->text.ink_l = il;
-                tl->text.ink_t = it;
-                tl->text.ink_r = ir + 1;
-                tl->text.ink_b = ib + 1;
-            }
-        }
-    }
+    render_text_preview_and_ink(*tl, lines, font_size_px, pw, ph, style,
+                                leading_px);
 
     return tl;
+}
+
+// Adds the background and its optional copy.
+void add_background_layers(psdw::Document& doc, std::vector<uint8_t>& img,
+                           int iw, int ih, const Style& style) {
+    auto bg = std::make_shared<psdw::PixelLayer>();
+    bg->name = "bg";
+    bg->x = 0; bg->y = 0; bg->w = iw; bg->h = ih;
+    bg->rgba = std::move(img);
+    apply_layer_settings(bg.get(), style);
+    doc.layers.push_back(bg);
+
+    // Optional copy of the background, directly above "bg" and below the
+    // "whites" whitening layer.
+    if (style.bg_copy.enabled) {
+        auto bgc = std::make_shared<psdw::PixelLayer>();
+        bgc->name = style.bg_copy.layer_name;
+        bgc->x = 0; bgc->y = 0; bgc->w = iw; bgc->h = ih;
+        bgc->rgba = bg->rgba;
+        apply_layer_settings(bgc.get(), style);
+        doc.layers.push_back(bgc);
+    }
+
+}
+
+// Adds the whitening layer directly above the background (below the text
+// layers), and prints/debug-dumps the box-limited scheme when enabled.
+void add_whiten_layer(psdw::Document& doc,
+                      const std::vector<uint8_t>& stroke_mask,
+                      const std::vector<dbnetBox>& boxes, int iw, int ih,
+                      const Style& style, const std::wstring& debug_dir,
+                      const std::string& stem) {
+    if (!style.dbnet.enabled || !style.dbnet.whiten.enabled) return;
+
+    WhitenStats stats;
+    std::vector<uint8_t> final_mask;
+    auto wl = make_whiten_layer(stroke_mask, boxes, iw, ih, style.dbnet.whiten,
+                                &final_mask, &stats);
+    if (style.dbnet.whiten.limit_to_boxes) {
+        // Debug dump: final whiten region (gray = painted) for tuning
+        // without opening the PSD.
+        if (!debug_dir.empty())
+            save_mask_png(debug_dir, stem, "_whiten", final_mask, iw, ih);
+        double kept = stats.dilated_px
+                          ? (double)stats.final_px * 100.0 / stats.dilated_px
+                          : 0.0;
+        printf("dbnet  : %s whiten mask=%zu dilated=%zu boxed=%zu "
+               "(kept %.1f%%, dropped %.1f%%)\n",
+               stem.c_str(), stats.mask_px, stats.dilated_px, stats.final_px,
+               kept, 100.0 - kept);
+    }
+    if (!wl) return;
+
+    // Global layer opacity first; the whiten-specific transparency setting
+    // (both 0-100 percent) multiplies it.
+    apply_layer_settings(wl.get(), style);
+    wl->opacity =
+        (uint8_t)std::llround((double)wl->opacity *
+                              style.dbnet.whiten.opacity / 100.0);
+    doc.layers.push_back(wl);
+}
+
+// Adds the text layers (grouped, then ungrouped) from the layout entries.
+void add_text_layers(psdw::Document& doc, const ImageBlock& blk, int iw,
+                     int ih, const Style& style, const Layout& layout,
+                     double dpi) {
+    const double font_size = style.font_size_pt;
+
+    // Group numbers used by this image's entries (mapping order, then entry
+    // order).
+    std::vector<int> gnums;
+    for (const auto& kv : layout.groups)
+        if (std::find(gnums.begin(), gnums.end(), kv.first) == gnums.end())
+            gnums.push_back(kv.first);
+    for (const auto& e : blk.entries)
+        if (e.group > 0 &&
+            std::find(gnums.begin(), gnums.end(), e.group) == gnums.end())
+            gnums.push_back(e.group);
+
+    // Groups are stacked bottom-to-top; the first mapped group ends up on top.
+    for (auto it = gnums.rbegin(); it != gnums.rend(); ++it) {
+        int g = *it;
+        auto grp = std::make_shared<psdw::Group>();
+        grp->name = group_name_of(layout, g);
+        grp->open = true;
+        for (const auto& e : blk.entries) {
+            if (e.group != g) continue;
+            auto tl = make_text_layer(e, iw, ih, font_size, style, dpi);
+            if (tl) grp->children.push_back(tl);
+        }
+        if (!grp->children.empty()) doc.layers.push_back(grp);
+    }
+
+    // Entries without a group (group <= 0)
+    for (const auto& e : blk.entries) {
+        if (e.group > 0) continue;
+        auto tl = make_text_layer(e, iw, ih, font_size, style, dpi);
+        if (tl) doc.layers.push_back(tl);
+    }
+}
+
+// Optional detection-box outline layer on top of the stack.
+void add_box_outline_layer(psdw::Document& doc,
+                           const std::vector<dbnetBox>& boxes, int iw, int ih,
+                           const Style& style) {
+    if (!style.dbnet.enabled || !style.dbnet.boxes.enabled) return;
+    if (auto bl = make_box_outline_layer(boxes, iw, ih,
+                                         style.dbnet.whiten.box_margin_x,
+                                         style.dbnet.whiten.box_margin_y,
+                                         style.dbnet.boxes)) {
+        apply_layer_settings(bl.get(), style);
+        if (style.dbnet.boxes.lock) apply_full_lock(bl.get());
+        doc.layers.push_back(bl);
+    }
 }
 
 bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
@@ -505,37 +812,37 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
         return false;
     }
 
-    // OCR text-region detection (optional, config "ocr"). Runs on the raw
+    // dbnet text-region detection (optional, config "dbnet"). Runs on the raw
     // image; the rotated quads and the per-pixel stroke mask feed the
     // whitening layer below.
-    std::vector<OcrBox> boxes;
+    std::vector<dbnetBox> boxes;
     std::vector<uint8_t> stroke_mask;
-    if (style.ocr.enabled) {
+    if (style.dbnet.enabled) {
         std::string oerr;
-        if (ocr_available()) {
-            OcrOptions opt;
-            opt.model_path = style.ocr.model;
-            opt.limit_side_len = style.ocr.limit_side_len;
-            opt.det_thresh = (float)style.ocr.det_thresh;
-            opt.box_thresh = (float)style.ocr.box_thresh;
-            opt.unclip_ratio = (float)style.ocr.unclip_ratio;
-            opt.min_side = (float)style.ocr.min_side;
-            opt.seg_thresh = (float)style.ocr.seg_thresh;
-            opt.min_box_area = style.ocr.min_box_area;
-            if (!ocr_detect(img, iw, ih, opt, boxes, stroke_mask, &oerr)) {
-                fprintf(stderr, "ocr: %s\n", oerr.c_str());
+        if (dbnet_available()) {
+            dbnetOptions opt;
+            opt.model_path = style.dbnet.model;
+            opt.limit_side_len = style.dbnet.limit_side_len;
+            opt.det_thresh = (float)style.dbnet.det_thresh;
+            opt.box_thresh = (float)style.dbnet.box_thresh;
+            opt.unclip_ratio = (float)style.dbnet.unclip_ratio;
+            opt.min_side = (float)style.dbnet.min_side;
+            opt.seg_thresh = (float)style.dbnet.seg_thresh;
+            opt.min_box_area = style.dbnet.min_box_area;
+            if (!dbnet_detect(img, iw, ih, opt, boxes, stroke_mask, &oerr)) {
+                fprintf(stderr, "dbnet: %s\n", oerr.c_str());
             } else {
                 size_t strokes = 0;
                 for (uint8_t v : stroke_mask) strokes += v;
-                printf("ocr  : %s -> %d region(s), %zu stroke pixel(s)\n",
+                printf("dbnet  : %s -> %d region(s), %zu stroke pixel(s)\n",
                        blk.image.c_str(), (int)boxes.size(), strokes);
             }
             if (!debug_dir.empty())
-                save_ocr_debug(img, iw, ih, boxes, stroke_mask, debug_dir,
+                save_dbnet_debug(img, iw, ih, boxes, stroke_mask, debug_dir,
                                stem_of(blk.image));
         } else {
             fprintf(stderr,
-                    "ocr: onnxruntime.dll unavailable, skipping detection\n");
+                    "dbnet: onnxruntime.dll unavailable, skipping detection\n");
         }
     }
 
@@ -553,60 +860,11 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
     doc.res_h = res_h;
     doc.res_v = res_v;
 
-    auto bg = std::make_shared<psdw::PixelLayer>();
-    bg->name = "bg";
-    bg->x = 0; bg->y = 0; bg->w = iw; bg->h = ih;
-    bg->rgba = std::move(img);
-    doc.layers.push_back(bg);
-
-    // Whitening layer directly above the background: covers the OCR-detected
-    // text regions without touching the "bg" pixels.
-    if (style.ocr.enabled && style.ocr.whiten.enabled) {
-        if (auto wl = make_whiten_layer(stroke_mask, iw, ih, style.ocr.whiten))
-            doc.layers.push_back(wl);
-    }
-
-    // Font size in points (Photoshop unit). The document carries no resolution
-    // info, so Photoshop uses 72 PPI and 1 pt == 1 px on screen.
-    double font_size = style.font_size_pt;
-
-    // Group numbers used by this image's entries (mapping order, then entry order)
-    std::vector<int> gnums;
-    for (const auto& kv : layout.groups)
-        if (std::find(gnums.begin(), gnums.end(), kv.first) == gnums.end())
-            gnums.push_back(kv.first);
-    for (const auto& e : blk.entries)
-        if (e.group > 0 && std::find(gnums.begin(), gnums.end(), e.group) == gnums.end())
-            gnums.push_back(e.group);
-
-    // Groups are stacked bottom-to-top; the first mapped group ends up on top.
-    for (auto it = gnums.rbegin(); it != gnums.rend(); ++it) {
-        int g = *it;
-        auto grp = std::make_shared<psdw::Group>();
-        grp->name = group_name_of(layout, g);
-        grp->open = true;
-        for (const auto& e : blk.entries) {
-            if (e.group != g) continue;
-            auto tl = make_text_layer(e, iw, ih, font_size, style, res_h);
-            if (tl) grp->children.push_back(tl);
-        }
-        if (!grp->children.empty()) doc.layers.push_back(grp);
-    }
-
-    // Entries without a group (group <= 0)
-    for (const auto& e : blk.entries) {
-        if (e.group > 0) continue;
-        auto tl = make_text_layer(e, iw, ih, font_size, style, res_h);
-        if (tl) doc.layers.push_back(tl);
-    }
-
-    // Detection-box outline layer on top: shows where white was painted.
-    if (style.ocr.enabled && style.ocr.boxes.enabled) {
-        if (auto bl = make_box_outline_layer(boxes, iw, ih,
-                                             style.ocr.whiten.margin,
-                                             style.ocr.boxes))
-            doc.layers.push_back(bl);
-    }
+    add_background_layers(doc, img, iw, ih, style);
+    add_whiten_layer(doc, stroke_mask, boxes, iw, ih, style, debug_dir,
+                     stem_of(blk.image));
+    add_text_layers(doc, blk, iw, ih, style, layout, res_h);
+    add_box_outline_layer(doc, boxes, iw, ih, style);
 
     return doc.write_wide(out_path, err);
 }
@@ -617,15 +875,15 @@ bool build_psd(const ImageBlock& blk, const std::wstring& txt_dir,
 void print_usage() {
     printf("lp2psd - generate PSD files from a layout text file\n\n");
     printf("usage: lp2psd <layout.txt> [--out <dir>] [--config <style.json>]\n");
-    printf("                     [--debug-ocr <dir>]\n\n");
+    printf("                     [--debug-dbnet <dir>]\n\n");
     printf("With no arguments a file dialog asks for the layout text file.\n");
     printf("The layout file references images in the same folder (one block per\n");
     printf("image) and places text layers at normalized positions with optional\n");
     printf("group numbers. Each image produces <image>.psd.\n\n");
-    printf("Optional OCR (config \"ocr\"): detects Japanese text regions for\n");
+    printf("Optional dbnet (config \"dbnet\"): detects Japanese text regions for\n");
     printf("whitening (rotated quads + per-pixel stroke mask). Requires\n");
     printf("onnxruntime.dll + the DBNet detection model next to the exe.\n");
-    printf("  --debug-ocr <dir>   save detection overlay PNGs/JSON to <dir>\n");
+    printf("  --debug-dbnet <dir>   save detection overlay PNGs/JSON to <dir>\n");
 }
 
 }  // namespace
@@ -637,13 +895,25 @@ int wmain(int argc, wchar_t** argv) {
     std::string txt_path, out_dir, cfg_path, debug_dir;
     for (int i = 1; i < argc; i++) {
         std::string a = wide_to_utf8(std::wstring(argv[i]));
-        if (a == "--out" && i + 1 < argc) out_dir = wide_to_utf8(std::wstring(argv[++i]));
-        else if (a == "--config" && i + 1 < argc)
+        auto need_value = [&](const char* flag) {
+            if (i + 1 < argc) return true;
+            fprintf(stderr, "missing value for %s\n", flag);
+            print_usage();
+            return false;
+        };
+        if (a == "--out") {
+            if (!need_value("--out")) return 2;
+            out_dir = wide_to_utf8(std::wstring(argv[++i]));
+        } else if (a == "--config") {
+            if (!need_value("--config")) return 2;
             cfg_path = wide_to_utf8(std::wstring(argv[++i]));
-        else if (a == "--debug-ocr" && i + 1 < argc)
+        } else if (a == "--debug-dbnet") {
+            if (!need_value("--debug-dbnet")) return 2;
             debug_dir = wide_to_utf8(std::wstring(argv[++i]));
-        else if (a == "--help" || a == "-h") { print_usage(); return 0; }
-        else if (txt_path.empty()) txt_path = a;
+        } else if (a == "--help" || a == "-h") {
+            print_usage();
+            return 0;
+        } else if (txt_path.empty()) txt_path = a;
         else {
             fprintf(stderr, "unknown argument: %s\n", a.c_str());
             print_usage();
@@ -706,7 +976,7 @@ int wmain(int argc, wchar_t** argv) {
     CreateDirectoryW(wout_dir.c_str(), nullptr);
     std::wstring wtxt_dir = utf8_to_wide(txt_dir);
 
-    // OCR model paths: absolute as-is; otherwise exe directory, then the
+    // dbnet model paths: absolute as-is; otherwise exe directory, then the
     // current working directory.
     auto resolve_model_path = [](std::string& path) {
         if (path.empty()) return;
@@ -719,7 +989,7 @@ int wmain(int argc, wchar_t** argv) {
             cand = model_w;
         path = wide_to_utf8(cand);
     };
-    resolve_model_path(style.ocr.model);
+    resolve_model_path(style.dbnet.model);
     std::wstring wdebug_dir;
     if (!debug_dir.empty()) {
         wdebug_dir = utf8_to_wide(debug_dir);
@@ -735,8 +1005,11 @@ int wmain(int argc, wchar_t** argv) {
 
     int ok = 0;
     for (const ImageBlock& blk : layout.images) {
-        std::string out_name =
-            style.prefix + stem_of(blk.image) + style.suffix + ".psd";
+        std::string out_name = stem_of(blk.image) + ".psd";
+        // Layout files may reference images in subfolders; flatten the name
+        // so the output stays a single file inside the output directory.
+        std::replace(out_name.begin(), out_name.end(), '/', '_');
+        std::replace(out_name.begin(), out_name.end(), '\\', '_');
         std::wstring out_path = wout_dir + L"\\" + utf8_to_wide(out_name);
         if (build_psd(blk, wtxt_dir, out_path, style, layout, wdebug_dir, &err)) {
             printf("OK   %s -> %s\n", blk.image.c_str(), out_name.c_str());

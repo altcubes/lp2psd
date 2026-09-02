@@ -66,10 +66,13 @@ TxLr 描述符条目:
 | `textGridding` | enum `None` | |
 | `Ornt` | enum `Hrzn` / `Vrtc` | 横排 / 竖排 |
 | `AntA` | enum `Annt` | 见下方取值表 |
+| `TxMg` | enum `TxMg`/`TxNM` | 文本网格(无),真实 PS 恒有此键 |
 | `bounds` | Obj(#Pnt ×4) | em box(点),锚点居中 |
 | `boundingBox` | Obj(#Pnt ×4) | 渲染墨迹框(点),锚点居中 |
 | `TextIndex` | long 0 | |
 | `EngineData` | tdta | 引擎数据(下节) |
+
+与真实 Photoshop 一致,所有描述符(TxLr、bounds、boundingBox、warp)的 **name 都是 1 个 `\0`**(`write_unicode` 写出 u32 长度 1 + `00 00`),不是空串(:1033-1062)。
 
 ### TySh 几何:`tysh_layout`(:962)
 
@@ -108,6 +111,7 @@ TxLr 描述符条目:
   - `Font` = 0(FontSet[0] 即配置的字体);
   - **`FontSize` = pt × dpi / 72**——Photoshop 按文档像素存储字号,读回时 `pt = 值 × 72 / dpi`,这样字符面板显示的就是配置的 pt 值;
   - 只写**非默认**样式(PS 自己也这样):手动行距才写 `AutoLeading:false` + `Leading`;竖排 + 开启标准垂直罗马对齐才写 `BaselineDirection:1`;非黑色才写 `FillColor`。
+  - 真实 PS 的 run 在 `BaselineDirection` 后恒写两条非默认属性:白色描边 `StrokeColor << /Type 1 /Values [ 1.0 1.0 1.0 1.0 ] >>` 与 `HindiNumbers false`(与默认样式表的 `[1,0,0,0]` 描边区分)。
 - **GridInfo**:固定关闭的网格。
 - **/AntiAlias**:int,见上表。
 - **Rendered.Shapes**:点文本(`ShapeType 0` + `PointBase`;段落文本是 ShapeType 1 + BoxBounds,本工具只用点文本,:688-694)+ `Procession`(方向,见上)。
@@ -115,11 +119,12 @@ TxLr 描述符条目:
 ### ResourceDict(:720)
 
 - `KinsokuSet` / `MojiKumiSet`:Photoshop 标准避头尾/注音规则集(固定内容)。
-- `ParagraphSheetSet` / `StyleSheetSet`:一个名为"正常 RGB"的默认样式表;`StyleSheetSet` 的 `StyleSheetData` 用 `make_full_style_data`(:524)写**全量默认样式**,其中 `Font`=2(指向 CJK 回退字体)、`BaselineDirection`=2。
-- **FontSet**(:767-784),当前 Photoshop 的三槽布局:
+- `ParagraphSheetSet` / `StyleSheetSet`:一个名为"正常 RGB"的默认样式表;`StyleSheetSet` 的 `StyleSheetData` 用 `make_full_style_data`(:524)写**全量默认样式**,其中 `Font`=3(指向 CJK 回退字体)、`FontSize`=**固定 12.0**(PS 恒写 12pt,图层自身样式由 StyleRun 提供)、`BaselineDirection`=2。
+- **FontSet**(:767-790),当前 Photoshop 的四槽布局:
   - `[0]` 配置字体,`FontType` 1(TrueType),`Script` = config 指定,否则 `font_script_of`(:449)按字体名关键词推断(默认西文 0;命中 CJK 关键词后按日/韩/繁体关键词细分,否则简体 3);
   - `[1]` `AdobeInvisFont`(FontType 0);
-  - `[2]` `AdobeHeitiStd-Regular`(FontType 2,Script 3)——默认样式表指向它。
+  - `[2]` `MyriadPro-Regular`(FontType 0,Script 0);
+  - `[3]` `AdobeHeitiStd-Regular`(FontType 2,Script 3)——默认样式表指向它。
 
 ### 为什么 PS 需要"更新所有文本图层"
 
@@ -139,6 +144,14 @@ TxLr 描述符条目:
 | 颜色叠加 | `sofi` | 混合模式 + 颜色 + 不透明度 |
 
 颜色统一 `write_color`(:847):`u16 0`(RGB 空间)+ 三个 `u16(c*257)`(0-255 → 0-65535);不透明度 `pct_to_byte`(:880)0-100 → 0-255。混合模式 4 字符 ID 映射见 `blend4`(:855)。
+
+## 图层不透明度与锁定
+
+每条图层记录写三处(:1394-1402、:1462-1470):
+
+- **不透明度字节**:blend mode 后 1 字节 0-255,config `layers.opacity`(0-100%)换算;255 = 完全不透明。
+- **flags 字节**:bit3 = PS5+ 标志(恒置),bit0 = 透明像素锁定(`transparency_locked`),bit1 = 隐藏(`!visible`)。对照真实 PS:普通图层 `0x08`,锁定透明像素后 `0x09`。
+- **lspf 块**:u32 位掩码,bit0 = 透明像素锁定、bit1 = 图像像素/编辑锁定、bit2 = 位置锁定。config `dbnet.boxes.lock` 开启时对 `dbnet_boxes` 图层三者全开 = `0x07`(PS"锁定全部")。老版本 PS 全锁另写 `0x80000000`(官方 sample 的 `bg 拷贝` 即如此),本工具按新格式写 `0x07`,解析器(ag-psd 等)均能识别。
 
 ## 与 psd-tools 对调调试
 

@@ -1,6 +1,8 @@
 #include "psd_writer.hpp"
 #include "psd_writer_internal.hpp"
 
+#include "textmetrics.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -127,20 +129,6 @@ std::vector<uint8_t> utf8_to_utf16be(const std::string& s) {
         i += extra + 1;
     }
     return out;
-}
-
-int utf16_length(const std::string& s) {
-    int n = 0;
-    size_t i = 0;
-    while (i < s.size()) {
-        uint8_t c = (uint8_t)s[i];
-        if (c < 0x80) { i += 1; n += 1; }
-        else if ((c & 0xE0) == 0xC0) { i += 2; n += 1; }
-        else if ((c & 0xF0) == 0xE0) { i += 3; n += 1; }
-        else if ((c & 0xF8) == 0xF0) { i += 4; n += 2; }
-        else { i += 1; n += 1; }
-    }
-    return n;
 }
 
 }  // namespace (UTF-8 helpers)
@@ -408,10 +396,10 @@ EDict make_fill_color(double r, double g, double bl) {
     return d;
 }
 
-EDict make_stroke_color() {
+EDict make_stroke_color(double r = 1.0, double g = 0.0, double bl = 0.0) {
     EDict d;
     edict_set(d, "Type", eInt(1));
-    edict_set(d, "Values", eList({eFlt(1.0), eFlt(0.0), eFlt(0.0), eFlt(0.0)}));
+    edict_set(d, "Values", eList({eFlt(1.0), eFlt(r), eFlt(g), eFlt(bl)}));
     return d;
 }
 
@@ -511,24 +499,24 @@ EDict make_run_style(const TextLayerData& t, double r, double g, double bl) {
     // Standard vertical Roman alignment (applies to vertical text only).
     if (t.orientation == 1 && t.standard_vertical_roman)
         edict_set(d, "BaselineDirection", eInt(1));
+    // Run styles carry an explicit white stroke (the default style sheet
+    // keeps Photoshop's red-ish fallback).
+    edict_set(d, "StrokeColor", eDictFrom(make_stroke_color(1.0, 1.0, 1.0)));
+    edict_set(d, "HindiNumbers", eBool(false));
     if (!(r == 0.0 && g == 0.0 && bl == 0.0))
         edict_set(d, "FillColor", eDictFrom(make_fill_color(r, g, bl)));
     return d;
 }
 
 // The ResourceDict StyleSheetSet is Photoshop's default style sheet. Real
-// Photoshop keeps it at a fixed 12 pt black default because it always uses
-// StyleRun for the layer's own style; we follow the configured size here as
-// well so the font-size setting stays effective no matter which sheet the
-// text engine consults.
+// Photoshop keeps it at a fixed 12 pt black default pointing at the CJK
+// fallback font (FontSet index 3) because it always uses StyleRun for the
+// layer's own style; the layer's text style (StyleRun) still uses FontSet
+// index 0 (the configured font).
 EDict make_full_style_data(const TextLayerData& t) {
     EDict d;
-    // The ResourceDict/DocumentResources default style sheet points at the
-    // CJK fallback entry (FontSet index 2, AdobeHeitiStd-Regular) exactly as
-    // Photoshop writes it; the layer's own text style (StyleRun) still uses
-    // FontSet index 0 (the configured font).
-    edict_set(d, "Font", eInt(2));
-    edict_set(d, "FontSize", eFlt(t.font_size * t.dpi / 72.0));
+    edict_set(d, "Font", eInt(3));
+    edict_set(d, "FontSize", eFlt(12.0));
     edict_set(d, "FauxBold", eBool(false));
     edict_set(d, "FauxItalic", eBool(false));
     edict_set(d, "AutoLeading", eBool(true));
@@ -604,31 +592,33 @@ EDict make_paragraph_sheet(const EDict& props, int default_sheet) {
     return d;
 }
 
-EDict make_engine_dict(const TextLayerData& t) {
-    std::string engine_text = t.text;
-    std::replace(engine_text.begin(), engine_text.end(), '\n', '\r');
-    engine_text += '\r';
-    // One run per line, exactly like Photoshop's own EngineData files.
-    std::vector<int> run_lengths;
+// Splits engine text into per-line run lengths (UTF-16 code units including
+// the line terminator), one run per line like Photoshop's EngineData.
+void split_engine_runs(const std::string& engine_text,
+                       std::vector<int>& run_lengths) {
     size_t seg_start = 0;
     for (size_t i = 0; i < engine_text.size(); i++) {
         if (engine_text[i] == '\r') {
-            run_lengths.push_back(
-                utf16_length(engine_text.substr(seg_start, i - seg_start + 1)));
+            run_lengths.push_back(textmetrics::utf16_length(
+                engine_text.substr(seg_start, i - seg_start + 1)));
             seg_start = i + 1;
         }
     }
-    if (run_lengths.empty()) run_lengths.push_back(utf16_length(engine_text));
-    double r = t.color[0] / 255.0, g = t.color[1] / 255.0, bl = t.color[2] / 255.0;
+    if (run_lengths.empty())
+        run_lengths.push_back(textmetrics::utf16_length(engine_text));
+}
 
-    EDict dict;
-
+EDict make_editor_dict(const std::string& engine_text) {
     EDict editor;
     edict_set(editor, "Text", eStr(engine_text));
-    edict_set(dict, "Editor", eDictFrom(editor));
+    return editor;
+}
 
+EDict make_paragraph_run(const TextLayerData& t,
+                         const std::vector<int>& run_lengths) {
     EDict para_default;
-    edict_set(para_default, "ParagraphSheet", eDictFrom(make_paragraph_sheet(EDict(), 0)));
+    edict_set(para_default, "ParagraphSheet",
+              eDictFrom(make_paragraph_sheet(EDict(), 0)));
     edict_set(para_default, "Adjustments", eDictFrom(make_adjustments()));
     EDict para_run_item;
     edict_set(para_run_item, "ParagraphSheet",
@@ -645,8 +635,11 @@ EDict make_engine_dict(const TextLayerData& t) {
     edict_set(para_run, "RunArray", eList(para_items));
     edict_set(para_run, "RunLengthArray", eList(para_lens));
     edict_set(para_run, "IsJoinable", eInt(1));
-    edict_set(dict, "ParagraphRun", eDictFrom(para_run));
+    return para_run;
+}
 
+EDict make_style_run(const TextLayerData& t, const std::vector<int>& run_lengths,
+                     double r, double g, double bl) {
     EDict sr_default_sheet;
     edict_set(sr_default_sheet, "StyleSheetData", eDictFrom(EDict()));
     EDict sr_default;
@@ -665,8 +658,10 @@ EDict make_engine_dict(const TextLayerData& t) {
     edict_set(style_run, "RunArray", eList(style_items));
     edict_set(style_run, "RunLengthArray", eList(style_lens));
     edict_set(style_run, "IsJoinable", eInt(2));
-    edict_set(dict, "StyleRun", eDictFrom(style_run));
+    return style_run;
+}
 
+EDict make_grid_info() {
     EDict grid;
     edict_set(grid, "GridIsOn", eBool(false));
     edict_set(grid, "ShowGrid", eBool(false));
@@ -675,11 +670,10 @@ EDict make_engine_dict(const TextLayerData& t) {
     edict_set(grid, "GridColor", eDictFrom(make_grid_color()));
     edict_set(grid, "GridLeadingFillColor", eDictFrom(make_grid_color()));
     edict_set(grid, "AlignLineHeightToGridFlags", eBool(false));
-    edict_set(dict, "GridInfo", eDictFrom(grid));
+    return grid;
+}
 
-    edict_set(dict, "AntiAlias", eInt(t.anti_alias));
-    edict_set(dict, "UseFractionalGlyphWidths", eBool(true));
-
+EDict make_rendered_dict(const TextLayerData& t) {
     EDict base;
     edict_set(base, "ShapeType", eInt(0));
     edict_set(base, "TransformPoint0", eList({eFlt(1.0), eFlt(0.0)}));
@@ -712,8 +706,28 @@ EDict make_engine_dict(const TextLayerData& t) {
     EDict rendered;
     edict_set(rendered, "Version", eInt(1));
     edict_set(rendered, "Shapes", eDictFrom(shapes));
-    edict_set(dict, "Rendered", eDictFrom(rendered));
+    return rendered;
+}
 
+EDict make_engine_dict(const TextLayerData& t) {
+    std::string engine_text = t.text;
+    std::replace(engine_text.begin(), engine_text.end(), '\n', '\r');
+    engine_text += '\r';
+    std::vector<int> run_lengths;
+    split_engine_runs(engine_text, run_lengths);
+    double r = t.color[0] / 255.0, g = t.color[1] / 255.0,
+           bl = t.color[2] / 255.0;
+
+    EDict dict;
+    edict_set(dict, "Editor", eDictFrom(make_editor_dict(engine_text)));
+    edict_set(dict, "ParagraphRun",
+              eDictFrom(make_paragraph_run(t, run_lengths)));
+    edict_set(dict, "StyleRun",
+              eDictFrom(make_style_run(t, run_lengths, r, g, bl)));
+    edict_set(dict, "GridInfo", eDictFrom(make_grid_info()));
+    edict_set(dict, "AntiAlias", eInt(t.anti_alias));
+    edict_set(dict, "UseFractionalGlyphWidths", eBool(true));
+    edict_set(dict, "Rendered", eDictFrom(make_rendered_dict(t)));
     return dict;
 }
 
@@ -761,7 +775,8 @@ EDict make_resource_dict(const TextLayerData& t) {
     edict_set(d, "StyleSheetSet", eList({eDictFrom(sss_item)}));
 
     // Current Photoshop layout: FontSet[0] is the real font, FontSet[1] the
-    // AdobeInvisFont placeholder, FontSet[2] the built-in CJK fallback
+    // AdobeInvisFont placeholder, FontSet[2] MyriadPro-Regular (the western
+    // UI fallback), FontSet[3] the built-in CJK fallback
     // (AdobeHeitiStd-Regular) used by the default style sheet.
     // FontType 0 = invis, 1 = TrueType, 2 = CFF/OTF.
     EDict font_item;
@@ -775,13 +790,19 @@ EDict make_resource_dict(const TextLayerData& t) {
     edict_set(invis, "Script", eInt(0));
     edict_set(invis, "FontType", eInt(0));
     edict_set(invis, "Synthetic", eInt(0));
+    EDict myriad;
+    edict_set(myriad, "Name", eStr("MyriadPro-Regular"));
+    edict_set(myriad, "Script", eInt(0));
+    edict_set(myriad, "FontType", eInt(0));
+    edict_set(myriad, "Synthetic", eInt(0));
     EDict heiti;
     edict_set(heiti, "Name", eStr("AdobeHeitiStd-Regular"));
     edict_set(heiti, "Script", eInt(3));
     edict_set(heiti, "FontType", eInt(2));
     edict_set(heiti, "Synthetic", eInt(0));
     edict_set(d, "FontSet",
-              eList({eDictFrom(font_item), eDictFrom(invis), eDictFrom(heiti)}));
+              eList({eDictFrom(font_item), eDictFrom(invis),
+                     eDictFrom(myriad), eDictFrom(heiti)}));
 
     edict_set(d, "SuperscriptSize", eFlt(0.583));
     edict_set(d, "SuperscriptPosition", eFlt(0.333));
@@ -931,23 +952,6 @@ void edict_set(EDict& d, const std::string& key, std::shared_ptr<EVal> v) {
 // ===========================================================================
 namespace {
 
-// Rough text width in em units (CJK glyphs = 1.0 em, Latin = 0.55 em), kept
-// in sync with main.cpp so the TySh layout matches the estimated box size.
-double est_line_units(const std::string& line) {
-    double units = 0;
-    size_t i = 0;
-    while (i < line.size()) {
-        uint8_t c = (uint8_t)line[i];
-        if (c < 0x80) {
-            units += 0.55;
-            i++;
-        } else if ((c & 0xE0) == 0xC0) i += 2, units += 0.55;
-        else if ((c & 0xF0) == 0xE0) i += 3, units += 1.0;
-        else i += 4, units += 1.0;
-    }
-    return units;
-}
-
 // Layout model of a real Photoshop point-text layer:
 //   - the TySh transform is the text anchor (document px);
 //   - the descriptor `bounds` is the em box in points, centered on the anchor;
@@ -978,12 +982,6 @@ TyShLayout tysh_layout(const TextLayerData& t) {
         lines.push_back(cur);
     }
     if (lines.size() == 1 && lines[0].empty()) lines[0] = " ";
-    double max_units = 1.0;
-    int max_chars = 1;
-    for (const auto& ln : lines) {
-        max_units = std::max(max_units, est_line_units(ln));
-        max_chars = std::max(max_chars, utf16_length(ln));
-    }
     // All TySh type geometry is stored in document pixels at the document
     // resolution, exactly like real Photoshop files (FontSize, em box and
     // layer rect all equal pt * dpi / 72 numerically).
@@ -992,20 +990,14 @@ TyShLayout tysh_layout(const TextLayerData& t) {
         t.auto_leading ? fs_px * t.auto_leading_size
                        : (t.leading > 0.0 ? t.leading * t.dpi / 72.0
                                           : fs_px * t.auto_leading_size);
-    double half_w, half_h;
-    if (t.orientation == 1) {
-        // Vertical: one em per column, columns advance right-to-left; height
-        // is the tallest column (chars * font size), as in the reference PSD.
-        half_w = std::max((double)lines.size() * fs_px, fs_px) / 2.0;
-        half_h = std::max((double)max_chars * fs_px, fs_px) / 2.0;
-    } else {
-        half_w = std::max(max_units * fs_px, fs_px) / 2.0;
-        half_h = std::max((double)lines.size() * leading_px, leading_px) / 2.0;
-    }
-    out.em_l = -half_w;
-    out.em_t = -half_h;
-    out.em_r = half_w;
-    out.em_b = half_h;
+    // Same estimate main.cpp uses for the layer rectangle, so the TySh em
+    // box and the layer record can never disagree.
+    textmetrics::Box box = textmetrics::estimate_box(
+        lines, t.orientation, fs_px, leading_px);
+    out.em_l = -box.w / 2.0;
+    out.em_t = -box.h / 2.0;
+    out.em_r = box.w / 2.0;
+    out.em_b = box.h / 2.0;
 
     if (!t.preview.empty() && t.ink_r > t.ink_l && t.ink_b > t.ink_t) {
         // Ink box is measured in preview pixels, i.e. the same document
@@ -1039,14 +1031,17 @@ std::vector<uint8_t> build_tysh(const TextLayerData& t) {
     text_data.add("textGridding", dEnum("textGridding", "None"));
     text_data.add("Ornt", dEnum("Ornt", t.orientation ? "Vrtc" : "Hrzn"));
     text_data.add("AntA", dEnum("Annt", anti_alias_enum(t.anti_alias)));
+    text_data.add("TxMg", dEnum("TxMg", "TxNM"));
     TyShLayout lay = tysh_layout(t);
     DValue bounds = dObj("bounds");
+    bounds.obj->name.assign(1, '\0');
     bounds.obj->add("Left", dPt(lay.em_l));
     bounds.obj->add("Top ", dPt(lay.em_t));
     bounds.obj->add("Rght", dPt(lay.em_r));
     bounds.obj->add("Btom", dPt(lay.em_b));
     text_data.add("bounds", std::move(bounds));
     DValue bbox = dObj("boundingBox");
+    bbox.obj->name.assign(1, '\0');
     bbox.obj->add("Left", dPt(lay.ink_l));
     bbox.obj->add("Top ", dPt(lay.ink_t));
     bbox.obj->add("Rght", dPt(lay.ink_r));
@@ -1057,6 +1052,7 @@ std::vector<uint8_t> build_tysh(const TextLayerData& t) {
 
     Descriptor warp;
     warp.class_id = "warp";
+    warp.name.assign(1, '\0');
     warp.add("warpStyle", dEnum("warpStyle", "warpNone"));
     warp.add("warpValue", dDouble(0.0));
     warp.add("warpPerspective", dDouble(0.0));
@@ -1217,8 +1213,11 @@ void collect_records(const std::vector<std::shared_ptr<LayerBase>>& items,
     }
 }
 
+// Alpha-composites `src` over `dst` at (ox, oy). `opacity` (0-255) scales the
+// source alpha so the merged image matches the layer record opacity.
 void paste_over(std::vector<uint8_t>& dst, int dw, int dh,
-                const uint8_t* src, int sw, int sh, int ox, int oy) {
+                const uint8_t* src, int sw, int sh, int ox, int oy,
+                uint8_t opacity = 255) {
     for (int y = 0; y < sh; y++) {
         int dy = oy + y;
         if (dy < 0 || dy >= dh) continue;
@@ -1228,6 +1227,8 @@ void paste_over(std::vector<uint8_t>& dst, int dw, int dh,
             const uint8_t* sp = src + ((size_t)y * sw + x) * 4;
             uint8_t* dp = dst.data() + ((size_t)dy * dw + dx) * 4;
             uint8_t a = sp[3];
+            if (opacity != 255)
+                a = (uint8_t)((a * (uint32_t)opacity) / 255);
             if (a == 0) continue;
             if (a == 255) {
                 dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = 255;
@@ -1277,40 +1278,40 @@ static void write_image_resources(Buffer& b, double res_h, double res_v) {
 
 }  // namespace
 
-static bool build_document_bytes(const Document& doc, std::vector<uint8_t>& bytes,
-                                 std::string* error) {
+namespace {
+
+struct Px {
+    std::vector<uint8_t> owned;
+    const uint8_t* data = nullptr;
+    int w = 0, h = 0;
+};
+
+// Collects the RGBA source of every pixel-bearing record (groups have none).
+bool gather_pixel_sources(const std::vector<Rec>& recs, std::vector<Px>& px,
+                          std::string* error) {
     auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
     };
-    if (doc.width <= 0 || doc.height <= 0) return fail("invalid document size");
-
-    std::vector<Rec> recs;
-    collect_records(doc.layers, recs);
-    if (recs.empty()) return fail("document has no layers");
-
-    // Layer pixel sources
-    struct Px {
-        std::vector<uint8_t> owned;
-        const uint8_t* data = nullptr;
-        int w = 0, h = 0;
-    };
-    std::vector<Px> px(recs.size());
+    px.assign(recs.size(), Px{});
     for (size_t i = 0; i < recs.size(); i++) {
         if (recs[i].lsct != 0) continue;
         int lw = 0, lh = 0;
         const uint8_t* src = nullptr;
         if (auto pl = dynamic_cast<const PixelLayer*>(recs[i].layer)) {
-            lw = pl->w; lh = pl->h;
+            lw = pl->w;
+            lh = pl->h;
             if (pl->rgba.size() != (size_t)lw * lh * 4)
-                return fail("pixel layer '" + pl->name + "' has wrong rgba size");
+                return fail("pixel layer '" + pl->name +
+                            "' has wrong rgba size");
             src = pl->rgba.data();
         } else if (auto tl = dynamic_cast<const TextLayer*>(recs[i].layer)) {
             lw = tl->right - tl->left;
             lh = tl->bottom - tl->top;
             if (!tl->text.preview.empty()) {
                 if (tl->text.preview.size() != (size_t)lw * lh * 4)
-                    return fail("text layer '" + tl->name + "' preview size mismatch");
+                    return fail("text layer '" + tl->name +
+                                "' preview size mismatch");
                 src = tl->text.preview.data();
             }
         }
@@ -1323,12 +1324,18 @@ static bool build_document_bytes(const Document& doc, std::vector<uint8_t>& byte
         px[i].w = lw;
         px[i].h = lh;
     }
+    return true;
+}
 
-    // Composite
-    std::vector<uint8_t> comp((size_t)doc.width * doc.height * 4, 0);
+// Flattens visible pixel layers into the merged composite, applying each
+// layer's opacity so the thumbnail matches the layer records.
+void build_composite(const Document& doc, const std::vector<Rec>& recs,
+                     const std::vector<Px>& px, std::vector<uint8_t>& comp) {
+    comp.assign((size_t)doc.width * doc.height * 4, 0);
     for (size_t i = 0; i < recs.size(); i++) {
         if (recs[i].lsct != 0 || !px[i].data) continue;
         const LayerBase* l = recs[i].layer;
+        if (!l->visible) continue;
         int ox = l->left, oy = l->top;
         if (auto pl = dynamic_cast<const PixelLayer*>(l)) {
             ox = pl->x;
@@ -1338,18 +1345,19 @@ static bool build_document_bytes(const Document& doc, std::vector<uint8_t>& byte
             oy = (int)std::llround(tl->text.box_y);
         }
         paste_over(comp, doc.width, doc.height, px[i].data, px[i].w, px[i].h,
-                   ox, oy);
+                   ox, oy, l->opacity);
     }
-    bool has_alpha = false;
-    for (size_t k = 3; k < comp.size(); k += 4)
-        if (comp[k] != 255) { has_alpha = true; break; }
-    int channels = has_alpha ? 4 : 3;
+}
 
-    // Channel data per record (alpha, R, G, B)
-    std::vector<std::vector<Chan>> chan(recs.size());
+// Builds the RLE channel data (alpha, R, G, B) per record.
+void build_layer_channel_data(const std::vector<Rec>& recs,
+                              const std::vector<Px>& px,
+                              std::vector<std::vector<Chan>>& chan) {
+    chan.assign(recs.size(), {});
     for (size_t i = 0; i < recs.size(); i++) {
         if (recs[i].lsct != 0 || !px[i].data) {
-            for (int16_t id : {int16_t(-1), int16_t(0), int16_t(1), int16_t(2)}) {
+            for (int16_t id :
+                 {int16_t(-1), int16_t(0), int16_t(1), int16_t(2)}) {
                 Buffer e;
                 e.u16(0);  // RAW, no data
                 chan[i].push_back({id, e.data()});
@@ -1368,130 +1376,211 @@ static bool build_document_bytes(const Document& doc, std::vector<uint8_t>& byte
             chan[i].push_back({ids[c], cb.data()});
         }
     }
+}
+
+// Writes the extra-data tagged blocks shared by every layer record.
+void write_layer_extra(Buffer& extra, const Rec& rec, int& id_counter) {
+    const LayerBase* l = rec.layer;
+    extra.u32(0);  // no layer mask
+    // Blending ranges: 4-byte length + composite + 4 channel ranges
+    extra.u32(40);
+    // 2 composite pairs + 4 channels x 2 pairs = 10 pairs of 16-bit values
+    for (int k = 0; k < 10; k++) {
+        extra.u16(0);
+        extra.u16(65535);
+    }
+    // Layer name (pascal string, UTF-8, padded to 4)
+    const std::string& nm = (rec.lsct == 3) ? "</Layer group>" : l->name;
+    std::string name8 = nm.substr(0, 254);
+    extra.u8((uint8_t)name8.size());
+    extra.raw(name8);
+    size_t name_pad = (4 - (1 + name8.size()) % 4) % 4;
+    for (size_t k = 0; k < name_pad; k++) extra.u8(0);
+
+    // Tagged blocks
+    if (rec.lsct != 0) {
+        Buffer ls;
+        ls.u32((uint32_t)rec.lsct);
+        ls.raw("8BIM");
+        ls.raw(rec.lsct == 3 ? "norm" : "pass");
+        ls.u32(0);
+        write_tagged(extra, "lsct", ls.data());
+    }
+    if (auto tl = dynamic_cast<const TextLayer*>(l))
+        write_tagged(extra, "TySh", build_tysh(tl->text));
+    std::vector<uint8_t> fx = build_lrfx(l->effects);
+    if (!fx.empty()) write_tagged(extra, "lrFX", fx);
+    {
+        Buffer v;
+        v.u32((uint32_t)nm.size());
+        v.raw(utf8_to_utf16be(nm));
+        write_tagged(extra, "luni", v.data());
+    }
+    write_tagged(extra, "lnsr",
+                 std::vector<uint8_t>{0x72, 0x65, 0x6E, 0x64});
+    {
+        Buffer v;
+        v.u32((uint32_t)id_counter++);
+        write_tagged(extra, "lyid", v.data());
+    }
+    {
+        Buffer v;
+        v.u8(1);
+        v.u8(0);
+        v.u8(0);
+        v.u8(0);
+        write_tagged(extra, "clbl", v.data());
+    }
+    {
+        Buffer v;
+        v.u8(0);
+        v.u8(0);
+        v.u8(0);
+        v.u8(0);
+        write_tagged(extra, "infx", v.data());
+        write_tagged(extra, "knko", v.data());
+    }
+    {
+        // lspf: protected settings bitmask
+        // (1 = transparency, 2 = composite/edit, 4 = position);
+        // lclr: sheet color (all-zero, matching the reference PSD).
+        uint32_t lspf = 0;
+        if (l->transparency_locked) lspf |= 0x01;
+        if (l->composite_locked) lspf |= 0x02;
+        if (l->position_locked) lspf |= 0x04;
+        Buffer pv;
+        pv.u32(lspf);
+        write_tagged(extra, "lspf", pv.data());
+        write_tagged(extra, "lclr", std::vector<uint8_t>(8, 0));
+    }
+    if (auto tl = dynamic_cast<const TextLayer*>(l)) {
+        // shmd: layer metadata setting (fixed layout from a real PSD).
+        static const uint8_t shmd[] = {
+            0x00, 0x00, 0x00, 0x01, 0x38, 0x42, 0x49, 0x4d,
+            0x63, 0x75, 0x73, 0x74, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x10,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x08, 0x6d, 0x65, 0x74, 0x61, 0x64, 0x61,
+            0x74, 0x61, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x09, 0x6c, 0x61, 0x79, 0x65, 0x72, 0x54,
+            0x69, 0x6d, 0x65, 0x64, 0x6f, 0x75, 0x62, 0x41,
+            0xda, 0x9c, 0xe3, 0x1e, 0x11, 0x80, 0xfd, 0x00,
+        };
+        write_tagged(extra, "shmd",
+                     std::vector<uint8_t>(shmd, shmd + sizeof(shmd)));
+        // fxrp: layer reference point = the text anchor (box center).
+        Buffer rp;
+        rp.f64(tl->text.box_x + tl->text.box_w / 2.0);
+        rp.f64(tl->text.box_y + tl->text.box_h / 2.0);
+        write_tagged(extra, "fxrp", rp.data());
+    }
+    extra.pad(2);
+}
+
+// Writes one layer record (header + extra data) into `lm`.
+void write_layer_record(Buffer& lm, const Rec& rec,
+                        const std::vector<Chan>& chans, int& id_counter) {
+    const LayerBase* l = rec.layer;
+    int top = l->top, left = l->left, bottom = l->bottom, right = l->right;
+    if (auto pl = dynamic_cast<const PixelLayer*>(l)) {
+        top = pl->y;
+        left = pl->x;
+        bottom = pl->y + pl->h;
+        right = pl->x + pl->w;
+    } else if (auto tl = dynamic_cast<const TextLayer*>(l)) {
+        top = (int)std::llround(tl->text.box_y);
+        left = (int)std::llround(tl->text.box_x);
+        bottom = (int)std::llround(tl->text.box_y + tl->text.box_h);
+        right = (int)std::llround(tl->text.box_x + tl->text.box_w);
+    }
+
+    lm.i32(top);
+    lm.i32(left);
+    lm.i32(bottom);
+    lm.i32(right);
+    lm.u16((uint16_t)chans.size());
+    for (const auto& c : chans) {
+        lm.i16(c.id);
+        lm.u32((uint32_t)c.bytes.size());
+    }
+    lm.raw("8BIM");
+    lm.raw("norm");
+    lm.u8(l->opacity);  // opacity (0-255)
+    lm.u8(0);           // clipping
+    // flags: bit3 = PS5+, bit0 = transparency protected (lock),
+    // bit1 = hidden.
+    uint8_t flags = l->visible ? 0x08 : 0x0A;
+    if (l->transparency_locked) flags |= 0x01;
+    lm.u8(flags);
+    lm.u8(0);  // filler
+
+    Buffer extra;
+    write_layer_extra(extra, rec, id_counter);
+    lm.u32((uint32_t)extra.size());
+    lm.raw(extra.data());
+}
+
+// Writes the merged image data (RLE over the flattened composite).
+void write_merged_image(Buffer& img, const Document& doc,
+                        const std::vector<uint8_t>& comp, int channels) {
+    img.u16(1);
+    std::vector<int> chan_idx;
+    for (int c = 0; c < channels && c < 4; c++) chan_idx.push_back(c);
+    std::vector<std::vector<uint8_t>> rows;
+    for (int ci : chan_idx) {
+        for (int y = 0; y < doc.height; y++) {
+            std::vector<uint8_t> row((size_t)doc.width);
+            for (int x = 0; x < doc.width; x++)
+                row[x] = comp[((size_t)y * doc.width + x) * 4 + ci];
+            rows.push_back(packbits(row.data(), row.size()));
+        }
+    }
+    for (const auto& r : rows) img.u16((uint16_t)r.size());
+    for (const auto& r : rows) img.raw(r);
+}
+
+}  // namespace
+
+static bool build_document_bytes(const Document& doc, std::vector<uint8_t>& bytes,
+                                 std::string* error) {
+    auto fail = [&](const std::string& msg) {
+        if (error) *error = msg;
+        return false;
+    };
+    if (doc.width <= 0 || doc.height <= 0) return fail("invalid document size");
+    // PSD stores each RLE row's byte count as u16; guard absurd widths early.
+    if (doc.width > 65000) return fail("document width too large for RLE row size");
+
+    std::vector<Rec> recs;
+    collect_records(doc.layers, recs);
+    if (recs.empty()) return fail("document has no layers");
+
+    std::vector<Px> px;
+    if (!gather_pixel_sources(recs, px, error)) return false;
+
+    std::vector<uint8_t> comp;
+    build_composite(doc, recs, px, comp);
+    bool has_alpha = false;
+    for (size_t k = 3; k < comp.size(); k += 4)
+        if (comp[k] != 255) {
+            has_alpha = true;
+            break;
+        }
+    int channels = has_alpha ? 4 : 3;
+
+    std::vector<std::vector<Chan>> chan;
+    build_layer_channel_data(recs, px, chan);
 
     // Assemble layer info (layer records + channel image data)
     Buffer lm;
     lm.i16((int16_t)recs.size());
-
     int id_counter = 1;
-    for (size_t i = 0; i < recs.size(); i++) {
-        const LayerBase* l = recs[i].layer;
-        int top = l->top, left = l->left, bottom = l->bottom, right = l->right;
-        if (auto pl = dynamic_cast<const PixelLayer*>(l)) {
-            top = pl->y; left = pl->x; bottom = pl->y + pl->h; right = pl->x + pl->w;
-        } else if (auto tl = dynamic_cast<const TextLayer*>(l)) {
-            top = (int)std::llround(tl->text.box_y);
-            left = (int)std::llround(tl->text.box_x);
-            bottom = (int)std::llround(tl->text.box_y + tl->text.box_h);
-            right = (int)std::llround(tl->text.box_x + tl->text.box_w);
-        }
-
-        lm.i32(top); lm.i32(left); lm.i32(bottom); lm.i32(right);
-        lm.u16((uint16_t)chan[i].size());
-        for (const auto& c : chan[i]) {
-            lm.i16(c.id);
-            lm.u32((uint32_t)c.bytes.size());
-        }
-        lm.raw("8BIM");
-        lm.raw("norm");
-        lm.u8(255);   // opacity
-        lm.u8(0);     // clipping
-        lm.u8(l->visible ? 0x08 : 0x0A);  // flags (bit3 = PS5+)
-        lm.u8(0);     // filler
-
-        // Extra data
-        Buffer extra;
-        extra.u32(0);  // no layer mask
-        // Blending ranges: 4-byte length + composite + 4 channel ranges
-        extra.u32(40);
-        // 2 composite pairs + 4 channels x 2 pairs = 10 pairs of 16-bit values
-        for (int k = 0; k < 10; k++) { extra.u16(0); extra.u16(65535); }
-        // Layer name (pascal string, UTF-8, padded to 4)
-        const std::string& nm = (recs[i].lsct == 3) ? "</Layer group>" : l->name;
-        std::string name8 = nm.substr(0, 254);
-        extra.u8((uint8_t)name8.size());
-        extra.raw(name8);
-        size_t name_pad = (4 - (1 + name8.size()) % 4) % 4;
-        for (size_t k = 0; k < name_pad; k++) extra.u8(0);
-
-        // Tagged blocks
-        if (recs[i].lsct != 0) {
-            Buffer ls;
-            ls.u32((uint32_t)recs[i].lsct);
-            ls.raw("8BIM");
-            ls.raw(recs[i].lsct == 3 ? "norm" : "pass");
-            ls.u32(0);
-            write_tagged(extra, "lsct", ls.data());
-        }
-        if (auto tl = dynamic_cast<const TextLayer*>(l)) {
-            write_tagged(extra, "TySh", build_tysh(tl->text));
-            std::vector<uint8_t> fx = build_lrfx(l->effects);
-            if (!fx.empty()) write_tagged(extra, "lrFX", fx);
-        } else {
-            std::vector<uint8_t> fx = build_lrfx(l->effects);
-            if (!fx.empty()) write_tagged(extra, "lrFX", fx);
-        }
-        {
-            Buffer v;
-            v.u32((uint32_t)nm.size());
-            v.raw(utf8_to_utf16be(nm));
-            write_tagged(extra, "luni", v.data());
-        }
-        write_tagged(extra, "lnsr",
-                     std::vector<uint8_t>{0x72, 0x65, 0x6E, 0x64});
-        {
-            Buffer v;
-            v.u32((uint32_t)id_counter++);
-            write_tagged(extra, "lyid", v.data());
-        }
-        {
-            Buffer v;
-            v.u8(1); v.u8(0); v.u8(0); v.u8(0);
-            write_tagged(extra, "clbl", v.data());
-        }
-        {
-            Buffer v;
-            v.u8(0); v.u8(0); v.u8(0); v.u8(0);
-            write_tagged(extra, "infx", v.data());
-            write_tagged(extra, "knko", v.data());
-        }
-        {
-            // lspf: protected settings; lclr: sheet color (both all-zero,
-            // matching the reference PSD written by Photoshop).
-            write_tagged(extra, "lspf", std::vector<uint8_t>(4, 0));
-            write_tagged(extra, "lclr", std::vector<uint8_t>(8, 0));
-        }
-        if (auto tl = dynamic_cast<const TextLayer*>(l)) {
-            // shmd: layer metadata setting (fixed layout from a real PSD).
-            static const uint8_t shmd[] = {
-                0x00, 0x00, 0x00, 0x01, 0x38, 0x42, 0x49, 0x4d,
-                0x63, 0x75, 0x73, 0x74, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x10,
-                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x08, 0x6d, 0x65, 0x74, 0x61, 0x64, 0x61,
-                0x74, 0x61, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-                0x00, 0x09, 0x6c, 0x61, 0x79, 0x65, 0x72, 0x54,
-                0x69, 0x6d, 0x65, 0x64, 0x6f, 0x75, 0x62, 0x41,
-                0xda, 0x9c, 0xe3, 0x1e, 0x11, 0x80, 0xfd, 0x00,
-            };
-            write_tagged(extra, "shmd",
-                         std::vector<uint8_t>(shmd, shmd + sizeof(shmd)));
-            // fxrp: layer reference point = the text anchor (box center).
-            Buffer rp;
-            rp.f64(tl->text.box_x + tl->text.box_w / 2.0);
-            rp.f64(tl->text.box_y + tl->text.box_h / 2.0);
-            write_tagged(extra, "fxrp", rp.data());
-        }
-        extra.pad(2);
-
-        lm.u32((uint32_t)extra.size());
-        lm.raw(extra.data());
-    }
+    for (size_t i = 0; i < recs.size(); i++)
+        write_layer_record(lm, recs[i], chan[i], id_counter);
 
     // Channel image data
     for (const auto& chans : chan)
         for (const auto& c : chans) lm.raw(c.bytes);
-
     lm.pad(4);
 
     // Wrap into layer & mask information (length + layer info)
@@ -1502,14 +1591,14 @@ static bool build_document_bytes(const Document& doc, std::vector<uint8_t>& byte
     Buffer out;
     out.raw("8BPS");
     out.u16(1);
-    out.u32(0);      // reserved
-    out.u16(0);      // reserved
+    out.u32(0);  // reserved
+    out.u16(0);  // reserved
     out.u16((uint16_t)channels);
     out.u32((uint32_t)doc.height);
     out.u32((uint32_t)doc.width);
-    out.u16(8);      // 8 bits/channel
-    out.u16(3);      // RGB
-    out.u32(0);      // color mode data
+    out.u16(8);  // 8 bits/channel
+    out.u16(3);  // RGB
+    out.u32(0);  // color mode data
     // Image resources (resolution block). Resources must be present for
     // Photoshop to display the intended canvas DPI.
     Buffer res;
@@ -1521,23 +1610,7 @@ static bool build_document_bytes(const Document& doc, std::vector<uint8_t>& byte
 
     // Merged image data (RLE)
     Buffer img;
-    img.u16(1);
-    std::vector<int> chan_idx;
-    if (channels >= 1) chan_idx.push_back(0);
-    if (channels >= 2) chan_idx.push_back(1);
-    if (channels >= 3) chan_idx.push_back(2);
-    if (channels >= 4) chan_idx.push_back(3);
-    std::vector<std::vector<uint8_t>> rows;
-    for (int ci : chan_idx) {
-        for (int y = 0; y < doc.height; y++) {
-            std::vector<uint8_t> row((size_t)doc.width);
-            for (int x = 0; x < doc.width; x++)
-                row[x] = comp[((size_t)y * doc.width + x) * 4 + ci];
-            rows.push_back(packbits(row.data(), row.size()));
-        }
-    }
-    for (size_t r = 0; r < rows.size(); r++) img.u16((uint16_t)rows[r].size());
-    for (const auto& r : rows) img.raw(r);
+    write_merged_image(img, doc, comp, channels);
     out.raw(img.data());
 
     bytes = out.data();

@@ -1,4 +1,4 @@
-// ocr.cpp - Text-region detection for whitening, using the m-i-t DBNet
+// dbnet.cpp - Text-region detection for whitening, using the m-i-t DBNet
 // detector (ResNet34 + DB head) exported to ONNX (scripts/export_dbnet_onnx.py).
 // This is the same detector yakuyomi-engine runs through NCNN; here it runs on
 // ONNX Runtime, dynamically loaded at runtime (exe starts fine without the
@@ -20,9 +20,9 @@
 //   mask: crop valid region -> bilinear resize to original -> threshold ->
 //   per-pixel stroke mask.
 
-#ifdef LP2PSD_WITH_OCR
+#ifdef LP2PSD_WITH_dbnet
 
-#include "ocr.hpp"
+#include "dbnet.hpp"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -43,6 +43,7 @@ namespace {
 
 const OrtApi* g_ort = nullptr;
 bool g_ort_tried = false;
+HMODULE g_ort_dll = nullptr;
 OrtEnv* g_env = nullptr;
 OrtSession* g_session = nullptr;
 std::string g_model;
@@ -51,28 +52,38 @@ std::string g_model;
 bool load_runtime() {
     if (g_ort_tried) return g_ort != nullptr;
     g_ort_tried = true;
-    HMODULE h = LoadLibraryW(L"onnxruntime.dll");
-    if (!h) return false;
-    auto base = (const OrtApiBase * (*)(void))GetProcAddress(h, "OrtGetApiBase");
-    if (!base) return false;
+    g_ort_dll = LoadLibraryW(L"onnxruntime.dll");
+    if (!g_ort_dll) return false;
+    auto base =
+        (const OrtApiBase * (*)(void))GetProcAddress(g_ort_dll, "OrtGetApiBase");
+    if (!base) {
+        FreeLibrary(g_ort_dll);
+        g_ort_dll = nullptr;
+        return false;
+    }
     g_ort = base()->GetApi(ORT_API_VERSION);
+    if (!g_ort) {
+        // Keep the DLL loaded once the API resolves: the session holds
+        // runtime pointers into it for the process lifetime.
+        FreeLibrary(g_ort_dll);
+        g_ort_dll = nullptr;
+    }
     return g_ort != nullptr;
 }
 
-#define ORT_CHECK(call)                                                    \
-    do {                                                                   \
-        OrtStatus* st__ = (call);                                          \
-        if (st__) {                                                        \
-            if (err) *err = std::string("onnxruntime: ") +                 \
-                            g_ort->GetErrorMessage(st__);                  \
-            g_ort->ReleaseStatus(st__);                                    \
-            return false;                                                  \
-        }                                                                  \
-    } while (0)
-
 bool ensure_session(const std::string& model_path, std::string* err) {
-    if (!g_env)
-        ORT_CHECK(g_ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "lp2psd", &g_env));
+    auto check = [&](OrtStatus* st, const char* what) -> bool {
+        if (!st) return true;
+        if (err) *err = std::string("onnxruntime: ") + what +
+                        g_ort->GetErrorMessage(st);
+        g_ort->ReleaseStatus(st);
+        return false;
+    };
+    if (!g_env && !check(
+                      g_ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "lp2psd",
+                                       &g_env),
+                      ""))
+        return false;
 
     if (g_session && g_model != model_path) {
         g_ort->ReleaseSession(g_session);
@@ -88,10 +99,17 @@ bool ensure_session(const std::string& model_path, std::string* err) {
     }
 
     OrtSessionOptions* so = nullptr;
-    ORT_CHECK(g_ort->CreateSessionOptions(&so));
+    if (!check(g_ort->CreateSessionOptions(&so), "")) return false;
     unsigned hw = std::thread::hardware_concurrency();
-    g_ort->SetIntraOpNumThreads(so, hw ? (int)hw : 1);
-    g_ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL);
+    if (!check(g_ort->SetIntraOpNumThreads(so, hw ? (int)hw : 1), "")) {
+        g_ort->ReleaseSessionOptions(so);
+        return false;
+    }
+    if (!check(g_ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL),
+               "")) {
+        g_ort->ReleaseSessionOptions(so);
+        return false;
+    }
     OrtStatus* st = g_ort->CreateSession(g_env, wpath.c_str(), so, &g_session);
     g_ort->ReleaseSessionOptions(so);
     if (st) {
@@ -267,7 +285,7 @@ bool min_area_rect(const std::vector<Pt>& points, RotRect& out) {
 // Returns text lines as quads in original-image coordinates.
 void lines_from_prob_map(const std::vector<float>& prob, int grid_w, int grid_h,
                          float ratio, int orig_w, int orig_h,
-                         const OcrOptions& opt, std::vector<OcrBox>& out) {
+                         const dbnetOptions& opt, std::vector<dbnetBox>& out) {
     const size_t n = prob.size();
     std::vector<uint8_t> visited(n, 0);
     std::vector<int> stack;
@@ -320,7 +338,7 @@ void lines_from_prob_map(const std::vector<float>& prob, int grid_w, int grid_h,
         RotRect wide = rect.unclip(opt.unclip_ratio);
         Pt c[4];
         wide.corners(c);
-        OcrBox box;
+        dbnetBox box;
         box.score = score;
         box.x = orig_w; box.y = orig_h;
         for (int k = 0; k < 4; k++) {
@@ -344,7 +362,7 @@ void lines_from_prob_map(const std::vector<float>& prob, int grid_w, int grid_h,
 // thresholds at seg_thresh (segToMask in yakuyomi Detector.kt).
 void seg_to_mask(const std::vector<float>& mask, int src_w, int src_h,
                  float ratio, int orig_w, int orig_h,
-                 const OcrOptions& opt, std::vector<uint8_t>& stroke_mask) {
+                 const dbnetOptions& opt, std::vector<uint8_t>& stroke_mask) {
     int nw = std::max(1, std::min((int)std::llround(orig_w * ratio), src_w));
     int nh = std::max(1, std::min((int)std::llround(orig_h * ratio), src_h));
     std::vector<float> valid((size_t)nw * nh);
@@ -363,10 +381,10 @@ void seg_to_mask(const std::vector<float>& mask, int src_w, int src_h,
 
 }  // namespace
 
-bool ocr_available() { return load_runtime(); }
+bool dbnet_available() { return load_runtime(); }
 
-bool ocr_detect(const std::vector<uint8_t>& rgba, int w, int h,
-                const OcrOptions& opt, std::vector<OcrBox>& out,
+bool dbnet_detect(const std::vector<uint8_t>& rgba, int w, int h,
+                const dbnetOptions& opt, std::vector<dbnetBox>& out,
                 std::vector<uint8_t>& stroke_mask, std::string* err) {
     out.clear();
     stroke_mask.clear();
@@ -408,37 +426,56 @@ bool ocr_detect(const std::vector<uint8_t>& rgba, int w, int h,
     }
 
     // ---- Inference ---------------------------------------------------------
+    auto check = [&](OrtStatus* st, const char* what) -> bool {
+        if (!st) return true;
+        if (err) *err = std::string("onnxruntime: ") + what +
+                        g_ort->GetErrorMessage(st);
+        g_ort->ReleaseStatus(st);
+        return false;
+    };
     OrtAllocator* al = nullptr;
-    ORT_CHECK(g_ort->GetAllocatorWithDefaultOptions(&al));
     char* in_name = nullptr;
     char* out0_name = nullptr;
     char* out1_name = nullptr;
-    ORT_CHECK(g_ort->SessionGetInputName(session, 0, al, &in_name));
-    ORT_CHECK(g_ort->SessionGetOutputName(session, 0, al, &out0_name));
-    ORT_CHECK(g_ort->SessionGetOutputName(session, 1, al, &out1_name));
-
     OrtMemoryInfo* mi = nullptr;
     OrtValue* in_t = nullptr;
     OrtValue* db_t = nullptr;
     OrtValue* mask_t = nullptr;
     bool ok = false;
     do {
-        ORT_CHECK(g_ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mi));
+        if (!check(g_ort->GetAllocatorWithDefaultOptions(&al), "")) break;
+        if (!check(g_ort->SessionGetInputName(session, 0, al, &in_name), ""))
+            break;
+        if (!check(g_ort->SessionGetOutputName(session, 0, al, &out0_name),
+                   ""))
+            break;
+        if (!check(g_ort->SessionGetOutputName(session, 1, al, &out1_name),
+                   ""))
+            break;
+        if (!check(g_ort->CreateCpuMemoryInfo(OrtArenaAllocator,
+                                              OrtMemTypeDefault, &mi),
+                   ""))
+            break;
         int64_t shape[4] = {1, 3, in_h, in_w};
-        ORT_CHECK(g_ort->CreateTensorWithDataAsOrtValue(
-            mi, input.data(), input.size() * sizeof(float), shape, 4,
-            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in_t));
+        if (!check(g_ort->CreateTensorWithDataAsOrtValue(
+                       mi, input.data(), input.size() * sizeof(float), shape, 4,
+                       ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in_t),
+                   ""))
+            break;
 
         const char* ins[] = {in_name};
         const char* outs[] = {out0_name, out1_name};
         OrtValue* out_vals[2] = {nullptr, nullptr};
-        ORT_CHECK(g_ort->Run(session, nullptr, ins, &in_t, 1, outs, 2, out_vals));
+        if (!check(g_ort->Run(session, nullptr, ins, &in_t, 1, outs, 2,
+                              out_vals),
+                   ""))
+            break;
         db_t = out_vals[0];
         mask_t = out_vals[1];
 
         auto read_dims = [&](OrtValue* v, std::vector<int64_t>& dims) -> bool {
             OrtTensorTypeAndShapeInfo* ti = nullptr;
-            ORT_CHECK(g_ort->GetTensorTypeAndShape(v, &ti));
+            if (!check(g_ort->GetTensorTypeAndShape(v, &ti), "")) return false;
             size_t nd = 0;
             g_ort->GetDimensionsCount(ti, &nd);
             dims.assign(std::max<size_t>(nd, 1), 1);
@@ -459,11 +496,17 @@ bool ocr_detect(const std::vector<uint8_t>& rgba, int w, int h,
             if (err) *err = "unexpected model output shape";
             break;
         }
+        
+        if (mask_dims[0] < 1 || mask_dims[1] < 1 || mw <= 0 || mh <= 0) {
+            if (err) *err = "unexpected mask output shape";
+            break;
+        }
 
         float* db = nullptr;
         float* mask = nullptr;
-        ORT_CHECK(g_ort->GetTensorMutableData(db_t, (void**)&db));
-        ORT_CHECK(g_ort->GetTensorMutableData(mask_t, (void**)&mask));
+        if (!check(g_ort->GetTensorMutableData(db_t, (void**)&db), "")) break;
+        if (!check(g_ort->GetTensorMutableData(mask_t, (void**)&mask), ""))
+            break;
 
         // ---- Postprocess: lines (rotated quads) ----------------------------
         std::vector<float> prob(area);
@@ -473,12 +516,9 @@ bool ocr_detect(const std::vector<uint8_t>& rgba, int w, int h,
 
         // ---- Postprocess: per-pixel stroke mask ----------------------------
         std::vector<float> mask_plane((size_t)mw * mh);
-        if ((size_t)mw * mh <= area) {
-            std::memcpy(mask_plane.data(), mask, sizeof(float) * mw * mh);
-            float mask_ratio = ratio * (float)mw / (float)in_w;
-            seg_to_mask(mask_plane, mw, mh, mask_ratio, w, h, opt,
-                        stroke_mask);
-        }
+        std::memcpy(mask_plane.data(), mask, sizeof(float) * mw * mh);
+        float mask_ratio = ratio * (float)mw / (float)in_w;
+        seg_to_mask(mask_plane, mw, mh, mask_ratio, w, h, opt, stroke_mask);
         ok = true;
     } while (false);
 
@@ -486,10 +526,12 @@ bool ocr_detect(const std::vector<uint8_t>& rgba, int w, int h,
     if (db_t) g_ort->ReleaseValue(db_t);
     if (mask_t) g_ort->ReleaseValue(mask_t);
     if (mi) g_ort->ReleaseMemoryInfo(mi);
-    if (in_name) al->Free(al, in_name);
-    if (out0_name) al->Free(al, out0_name);
-    if (out1_name) al->Free(al, out1_name);
+    if (al) {
+        if (in_name) al->Free(al, in_name);
+        if (out0_name) al->Free(al, out0_name);
+        if (out1_name) al->Free(al, out1_name);
+    }
     return ok;
 }
 
-#endif  // LP2PSD_WITH_OCR
+#endif  // LP2PSD_WITH_dbnet

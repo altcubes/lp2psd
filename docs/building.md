@@ -17,9 +17,9 @@ cmake --build build --config Release
 
 > 注意源码大量使用 UTF-8 中文注释与字符串字面量(如 Kinsoku 表、字体映射),`/utf-8` 不可移除。
 
-### 可选 OCR 支持
+### 可选 dbnet 支持
 
-CMake 自动探测 `third_party/onnxruntime/include/onnxruntime_c_api.h`:存在则定义 `LP2PSD_WITH_OCR` 并编译 `src/ocr.cpp`,否则静默跳过(OCR 相关代码以桩函数降级)。运行期 `onnxruntime.dll` 与检测模型也缺失时功能自动禁用——三层降级,构建和基础功能永远可用。依赖获取与原理见 [ocr.md](ocr.md)。
+CMake 自动探测 `third_party/onnxruntime/include/onnxruntime_c_api.h`:存在则定义 `LP2PSD_WITH_dbnet` 并编译 `src/dbnet.cpp`,否则静默跳过(dbnet 相关代码以桩函数降级)。运行期 `onnxruntime.dll` 与检测模型也缺失时功能自动禁用——三层降级,构建和基础功能永远可用。依赖获取与原理见 [dbnet.md](dbnet.md)。
 
 ## 运行与冒烟测试
 

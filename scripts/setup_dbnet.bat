@@ -1,12 +1,12 @@
 @echo off
-rem Downloads the optional OCR dependencies:
+rem Downloads the optional dbnet dependencies:
 rem   - onnxruntime prebuilt package -> third_party\onnxruntime\{include,lib}
 rem   - DBNet detection model (ONNX) -> dbnet_detect.onnx (repo root)
 rem     (exported from the m-i-t detector via scripts\export_dbnet_onnx.py;
-rem     needs Python + torch, see docs/ocr.md)
+rem     needs Python + torch, see docs/dbnet.md)
 rem After running this, rebuild (build.bat); the script also copies
-rem onnxruntime.dll next to the built exe. Then enable OCR in config.json
-rem ("ocr"."enabled": true). See docs/ocr.md for details.
+rem onnxruntime.dll next to the built exe. Then enable dbnet in config.json
+rem ("dbnet"."enabled": true). See docs/dbnet.md for details.
 
 setlocal
 set ORT_VERSION=1.19.2
@@ -40,14 +40,14 @@ if exist "dbnet_detect.onnx" (
     echo [OK] dbnet_detect.onnx already present, skipping export
 ) else (
     echo Exporting dbnet_detect.onnx ...
-    where python >nul 2>nul || (echo [ERROR] python not found - see docs/ocr.md for manual export & exit /b 1)
+    where python >nul 2>nul || (echo [ERROR] python not found - see docs/dbnet.md for manual export & exit /b 1)
     python -c "import torch, torchvision" >nul 2>nul || (
         echo [ERROR] torch/torchvision not installed - run:
         echo     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        echo then rerun this script, or see docs/ocr.md
+        echo then rerun this script, or see docs/dbnet.md
         exit /b 1
     )
-    python scripts\export_dbnet_onnx.py dbnet_detect.onnx || (echo [ERROR] export failed - see docs/ocr.md & exit /b 1)
+    python scripts\export_dbnet_onnx.py dbnet_detect.onnx || (echo [ERROR] export failed - see docs/dbnet.md & exit /b 1)
 )
 
 rem ---- place the DLL next to the built exe ----------------------------------
@@ -59,6 +59,6 @@ if exist "build\Release\lp2psd.exe" (
 )
 
 echo.
-echo Done. Now rebuild, set config.json "ocr"."enabled": true, and run.
+echo Done. Now rebuild, set config.json "dbnet"."enabled": true, and run.
 endlocal
 exit /b 0

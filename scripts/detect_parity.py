@@ -7,7 +7,7 @@ Usage:
   python scripts/detect_parity.py <image> <cpp_dbg_dir> [--ref parity_out]
 
 The C++ debug dir must contain <stem>_quads.json and <stem>_mask.png
-(produced by lp2psd --debug-ocr).
+(produced by lp2psd --debug-dbnet).
 """
 
 import argparse

@@ -10,21 +10,22 @@ add_executable(lp2psd
     src/style.cpp
     src/image.cpp
     src/psd_writer.cpp
+    src/textmetrics.cpp
 )
 target_include_directories(lp2psd PRIVATE src)
 
-# Optional OCR support (Japanese text-region detection via the m-i-t DBNet
+# Optional dbnet support (Japanese text-region detection via the m-i-t DBNet
 # detector on ONNX Runtime). Enabled automatically when the onnxruntime
 # prebuilt package is present under third_party/onnxruntime (see
-# scripts/setup_ocr.bat and docs/ocr.md).
+# scripts/setup_dbnet.bat and docs/dbnet.md).
 set(ONNXRUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime")
 if(EXISTS "${ONNXRUNTIME_DIR}/include/onnxruntime_c_api.h")
-    target_sources(lp2psd PRIVATE src/ocr.cpp)
-    target_compile_definitions(lp2psd PRIVATE LP2PSD_WITH_OCR)
+    target_sources(lp2psd PRIVATE src/dbnet.cpp)
+    target_compile_definitions(lp2psd PRIVATE LP2PSD_WITH_dbnet)
     target_include_directories(lp2psd PRIVATE "${ONNXRUNTIME_DIR}/include")
-    message(STATUS "OCR enabled (onnxruntime: ${ONNXRUNTIME_DIR})")
+    message(STATUS "dbnet enabled (onnxruntime: ${ONNXRUNTIME_DIR})")
 else()
-    message(STATUS "OCR disabled: third_party/onnxruntime not found")
+    message(STATUS "dbnet disabled: third_party/onnxruntime not found")
 endif()
 
 if(MSVC)

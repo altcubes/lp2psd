@@ -7,3 +7,4 @@ parity_out/
 testfile/
 third_party/
 *.onnx
+.zcode/

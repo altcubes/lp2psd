@@ -1,16 +1,16 @@
-# OCR：日文检测与自动涂白
+# DBNet 检测与自动涂白
 
-lp2psd 的可选 OCR 功能用 **manga-image-translator (m-i-t) 的 DBNet 检测器**（ResNet34 + DB head，即 yakuyomi-engine 的 Detector 方案）定位图片中的日文文本，生成**涂白图层**覆盖原文：
+lp2psd 的可选 dbnet 功能用 **manga-image-translator (m-i-t) 的 DBNet 检测器**（ResNet34 + DB head，即 yakuyomi-engine 的 Detector 方案）定位图片中的日文文本，生成**涂白图层**覆盖原文：
 
 1. **逐像素笔画遮罩**——检测器额外输出文字笔画 mask，涂白图层只覆盖笔画本身（外扩 `whiten.margin` 像素盖住抗锯齿边缘），不再是一整块白色矩形。深色背景上的文字涂白后也不再是显眼白块。
-2. **旋转四边形文字行**——每条文字行给四个角点（`OcrBox.quad`），支持横排/竖排/倾斜文本；`ocr.boxes` 描边图层按四边形描边，`--debug-ocr` 调试图也画四边形。
+2. **旋转四边形文字行**——每条文字行给四个角点（`dbnetBox.quad`），支持横排/竖排/倾斜文本；`dbnet.boxes` 描边图层按四边形描边，`--debug-dbnet` 调试图也画四边形。
 
 只做**检测**，不做内容识别；因此只需一个 DBNet 检测模型，没有识别模型和解码管线。DBNet 是语言无关的行/列区域检测，对日文竖排（漫画主流排版）与横排均有效。
 
 ## 依赖安装
 
 ```bat
-scripts\setup_ocr.bat
+scripts\setup_dbnet.bat
 ```
 
 脚本下载两样东西（gitignore，不入库）：
@@ -36,12 +36,12 @@ out0 [1,2,H,W]  db（全分辨率）：ch0 = shrink_map 原始 logits（未 sigm
 out1 [1,1,H/2,W/2] mask：逐像素文字笔画遮罩（已 sigmoid）
 ```
 
-⚠️ 不要用仓库里旧的 `db_resnet34-*.onnx`（单通道 logits、固定 1024×1024 输入）：那是已退役的 comic-text-detector 模型，没有笔画 mask 输出。旧 `ocr_det.onnx`（PP-OCR DB）也已不再使用。
+⚠️ 不要用仓库里旧的 `db_resnet34-*.onnx`（单通道 logits、固定 1024×1024 输入）：那是已退役的 comic-text-detector 模型，没有笔画 mask 输出。旧 `dbnet_det.onnx`（PP-dbnet DB）也已不再使用。
 
 ## config.json 配置
 
 ```json
-"ocr": {
+"dbnet": {
   "enabled": false,                  // 总开关,默认关闭
   "model": "dbnet_detect.onnx",      // 相对 exe 目录,找不到时回落当前目录;绝对路径直接用
   "whiten": {
@@ -53,12 +53,12 @@ out1 [1,1,H/2,W/2] mask：逐像素文字笔画遮罩（已 sigmoid）
   "boxes": {
     "enabled": false,                // 四边形描边图层开关(图层栈最顶部)
     "color": [255, 0, 0],
-    "layerName": "ocr_boxes"
+    "layerName": "dbnet_boxes"
   }
 }
 ```
 
-调参项（写在 `ocr` 节，一般不用动）：
+调参项（写在 `dbnet` 节，一般不用动）：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -72,7 +72,7 @@ out1 [1,1,H/2,W/2] mask：逐像素文字笔画遮罩（已 sigmoid）
 
 旧字段兼容：`detThresh` 仍可作为 `dbBinThreshold` 的别名读取；`unclipPx`（固定像素膨胀）已由 `dbUnclipRatio`（比例膨胀）取代，不再读取。
 
-## 检测管线（src/ocr.cpp）
+## 检测管线（src/dbnet.cpp）
 
 ```
 RGBA 原图
@@ -81,7 +81,7 @@ RGBA 原图
  → ONNX Runtime CPU 推理
    ├─ out0 db → sigmoid(ch0) → 二值化(dbBinThreshold)
    │    → 8 连通域 → 边界点 → 凸包旋转卡尺 minAreaRect
-   │    → unclip(dbUnclipRatio) → 旋转四边形(原图坐标) → 过滤 → OcrBox.quad
+   │    → unclip(dbUnclipRatio) → 旋转四边形(原图坐标) → 过滤 → dbnetBox.quad
    └─ out1 mask → 裁有效区 → 双线性放大回原图 → 阈值(segThreshold)
         → 逐像素笔画遮罩 stroke_mask
 ```
@@ -91,12 +91,12 @@ RGBA 原图
 ## 调试
 
 ```bat
-lp2psd.exe text.txt --config config.json --debug-ocr build\ocrdbg
+lp2psd.exe text.txt --config config.json --debug-dbnet build\dbnetdbg
 ```
 
-`--debug-ocr <dir>` 对每张图输出三个文件：
+`--debug-dbnet <dir>` 对每张图输出三个文件：
 
-- `<图片名>_ocr.png`：**绿 = 笔画遮罩、红 = 旋转四边形框**——调 `dbBinThreshold`/`dbBoxThreshold`/`segThreshold` 的主要手段；
+- `<图片名>_dbnet.png`：**绿 = 笔画遮罩、红 = 旋转四边形框**——调 `dbBinThreshold`/`dbBoxThreshold`/`segThreshold` 的主要手段；
 - `<图片名>_mask.png`：灰度笔画遮罩；
 - `<图片名>_quads.json`：机器可读的四边形与分数（供 parity 对比）。
 

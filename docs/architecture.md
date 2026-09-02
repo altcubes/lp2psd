@@ -25,13 +25,14 @@ parse_layout()                    src/layout.cpp:63
 │                                                                              │
 │  确定画布 DPI:config "dpi" 覆盖图片自带 DPI(src/main.cpp:280-289)          │
 │                                                                              │
-│  [可选] OCR 检测(config ocr.enabled):ocr_detect() 得到旋转四边形 +          │
-│      逐像素笔画遮罩 → make_whiten_layer() 按笔画填白(bg 之上)              │
+│  [可选] dbnet 检测(config dbnet.enabled):dbnet_detect() 得到旋转四边形 +          │
+│      逐像素笔画遮罩 → make_whiten_layer() 默认"笔画外扩∩框外扩"填白       │
+│      (limitToBoxes=false 时回退为全 mask 外扩;bg 之上)                     │
 │                                                                              │
 │  对每个 TextEntry:make_text_layer()  src/main.cpp:157                        │
 │      • 展开字面 "\r"/"\n" 转义换行                                            │
 │      • px_scale = dpi / 72:字号在 72dpi 点空间,几何在文档像素空间            │
-│      • 估算文本框尺寸(横排/竖排)                                             │
+│      • textmetrics::estimate_box() 估算文本框尺寸(与 TySh bounds 共用)      │
 │      • render_text_preview() 用 GDI+ 渲染 RGBA 预览并扫描 ink bbox            │
 │                                                                              │
 │  组装 psdw::Document:                                                        │
@@ -44,7 +45,7 @@ parse_layout()                    src/layout.cpp:63
 └──────────────────────────────────────────────────────────────────────────────┘
         │
         ▼
-<输出目录>/<图片名>.psd  (可用 config prefix/suffix 改名)
+<输出目录>/<图片名去扩展名>.psd
 ```
 
 ## 模块分层
@@ -56,11 +57,11 @@ parse_layout()                    src/layout.cpp:63
 ├─────────────────────────────────────────────────────────┤
 │ 业务模型                                                 │
 │   layout.*   LabelPlus txt 解析                          │
-│   style.*    config.json 样式配置(含 OcrConfig)          │
+│   style.*    config.json 样式配置(含 dbnetConfig)          │
 │   image.*    GDI+ 图片加载 / 文本预览渲染 / DPI 读取      │
-│   ocr.*      可选:日文文本区域检测(m-i-t DBNet,ONNX Runtime)│
+│   dbnet.*      可选:日文文本区域检测(m-i-t DBNet,ONNX Runtime)│
 │              → 旋转四边形 + 笔画遮罩涂白;缺依赖时桩函数降级  │
-│              (src/ocr.hpp)                                │
+│              (src/dbnet.hpp)                                │
 ├─────────────────────────────────────────────────────────┤
 │ 通用 PSD 写入库   src/psd_writer.*                       │
 │   公开模型:Document / Group / PixelLayer / TextLayer     │
@@ -98,6 +99,6 @@ parse_layout()                    src/layout.cpp:63
 
 ## 输出文件布局
 
-- 输出目录:`<txt 所在目录>\output`,或 `--out` 指定(src/main.cpp:414-419)。注意 config 里的 `outputDir` 字段会被解析(style.hpp:30)但**并未被 main.cpp 使用**。
-- 输出文件名:`<prefix><图片名去扩展名><suffix>.psd`(src/main.cpp:431-433)。
+- 输出目录:`<txt 所在目录>\output`,或 `--out` 指定(src/main.cpp:414-419)。
+- 输出文件名:`<图片名去扩展名>.psd`(src/main.cpp:433-434),不再支持 config 改名。
 - 全部成功后自动用 Explorer 打开输出目录(src/main.cpp:442-446)。

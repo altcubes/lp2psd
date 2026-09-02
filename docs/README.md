@@ -13,7 +13,7 @@ lp2psd:根据 [LabelPlus](https://github.com/LabelPlus/LabelPlus) 排版 txt 生
 | 3 | [config.md](config.md) | config.json 全参数配置文档(字段、默认值、取值) |
 | 4 | [labelplus-format.md](labelplus-format.md) | LabelPlus 排版 txt 格式规范(解析器行为) |
 | 5 | [psd-internals.md](psd-internals.md) | PSD 字节级机制:TySh、EngineData、lrFX、取值映射表 |
-| 6 | [ocr.md](ocr.md) | OCR 日文检测:自动涂白、依赖与调参 |
+| 6 | [dbnet.md](dbnet.md) | dbnet 日文检测:自动涂白、依赖与调参 |
 | 7 | [building.md](building.md) | 构建、冒烟测试、psd-tools 调试方法 |
 | 8 | [roadmap.md](roadmap.md) | 已知限制、Txt2 历史教训、改进方向 |
 

@@ -1,8 +1,5 @@
 {
   "dpi": "original",
-  "outputDir": "",
-  "prefix": "",
-  "suffix": "",
   "font": {
     "name": "Microsoft YaHei",
     "postScript": "",
@@ -18,8 +15,8 @@
     "standardVerticalRomanAlignment": true,
     "script": "auto"
   },
-  "ocr": {
-    "enabled": false,
+  "dbnet": {
+    "enabled": true,
     "model": "dbnet_detect.onnx",
     "limitSideLen": 1024,
     "dbBinThreshold": 0.5,
@@ -32,12 +29,24 @@
       "enabled": true,
       "color": [255, 255, 255],
       "margin": 3,
-      "layerName": "whites"
+      "boxMarginX": 3,
+      "boxMarginY": 3,
+      "limitToBoxes": true,
+      "layerName": "whites",
+      "transparency": 0
     },
     "boxes": {
       "enabled": true,
       "color": [255, 0, 0],
-      "layerName": "ocr_boxes"
+      "layerName": "dbnet_boxes",
+      "lock": true
     }
+  },
+  "bgCopy": {
+    "enabled": true,
+    "layerName": "bg 拷贝"
+  },
+  "layers": {
+    "opacity": 100
   }
 }

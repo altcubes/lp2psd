@@ -1,29 +1,23 @@
 #include "layout.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 
+#include "strutil.hpp"
 #include "textcodec.hpp"
 
 namespace {
 
-std::string trim(const std::string& s) {
-    size_t a = s.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) return {};
-    size_t b = s.find_last_not_of(" \t\r\n");
-    return s.substr(a, b - a + 1);
-}
-
-std::string lower_ascii(std::string s) {
-    for (char& c : s)
-        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-    return s;
-}
-
-// "----[N]----[x,y,group]": parses the entry header line.
+// "----[N]----[x,y,group]": parses the entry header line. Returns false when
+// the line is not an entry header. If the line has the header shape
+// (bracketed numeric index + second bracket group) but its fields are not
+// valid numbers, sets *why so the caller can report and skip the line
+// instead of silently shifting the remaining fields.
 bool parse_entry_line(const std::string& line, int& idx, double& x,
-                      double& y, int& group) {
+                      double& y, int& group, std::string* why = nullptr) {
     size_t b1 = line.find('[');
     if (b1 == std::string::npos) return false;
     size_t e1 = line.find(']', b1);
@@ -41,19 +35,42 @@ bool parse_entry_line(const std::string& line, int& idx, double& x,
     std::string fields = line.substr(b2 + 1, e2 - b2 - 1);
     std::vector<double> nums;
     std::string cur;
+    auto parse_num = [](const std::string& t, double& v) {
+        if (t.empty()) return false;
+        char* end = nullptr;
+        v = std::strtod(t.c_str(), &end);
+        return end != t.c_str() && *end == '\0' && std::isfinite(v);
+    };
+    auto fail = [&](const std::string& msg) {
+        if (why) *why = msg;
+        return false;
+    };
     for (char c : fields) {
         if (c == ',') {
-            if (!cur.empty()) { nums.push_back(std::atof(cur.c_str())); cur.clear(); }
+            double v = 0;
+            if (!cur.empty()) {
+                if (!parse_num(cur, v))
+                    return fail("field '" + cur + "' is not a number");
+                nums.push_back(v);
+            }
+            cur.clear();
         } else {
             cur += c;
         }
     }
-    if (!cur.empty()) nums.push_back(std::atof(cur.c_str()));
-    if (nums.size() < 3) return false;
+    double v = 0;
+    if (!cur.empty()) {
+        if (!parse_num(cur, v))
+            return fail("field '" + cur + "' is not a number");
+        nums.push_back(v);
+    }
+    if (nums.size() < 3)
+        return fail("expected 3 comma-separated numbers [x,y,group]");
 
     idx = std::atoi(index_str.c_str());
-    x = nums[0];
-    y = nums[1];
+    // Normalized coordinates are documented as 0..1 of the image size.
+    x = std::max(0.0, std::min(1.0, nums[0]));
+    y = std::max(0.0, std::min(1.0, nums[1]));
     group = (int)nums[2];
     return true;
 }
@@ -75,9 +92,11 @@ bool parse_layout(const std::wstring& path, Layout& out, std::string* err) {
     ImageBlock* block = nullptr;
     TextEntry* entry = nullptr;
     int next_group_num = 1;
+    size_t line_no = 0;
 
     for (const std::string& raw : lines) {
-        std::string line = trim(raw);
+        line_no++;
+        std::string line = strutil::trim(raw);
         if (line.empty()) continue;
 
         if (line.rfind(">>>>>>>>[", 0) == 0 || line.rfind(">>>>>>>>>[", 0) == 0) {
@@ -108,7 +127,7 @@ bool parse_layout(const std::wstring& path, Layout& out, std::string* err) {
             bool handled = false;
             size_t dash = line.find("---");
             if (dash != std::string::npos && dash > 0) {
-                std::string name = trim(line.substr(0, dash));
+                std::string name = strutil::trim(line.substr(0, dash));
                 if (name.empty()) continue;
                 handled = true;
                 int num = next_group_num++;
@@ -138,11 +157,11 @@ bool parse_layout(const std::wstring& path, Layout& out, std::string* err) {
                 // Plain group-name line (real-world format). Anything that is
                 // not a separator/comment/header line is treated as a group
                 // name; the count is capped by the actual entries' group ids.
-                // "1,0" style header lines (document id, page id) are skipped.
-                bool coord_header = false;
-                {
-                    size_t comma = line.find(',');
-                    if (comma != std::string::npos) {
+        // "1,0" style header lines (document id, page id) are skipped.
+        bool coord_header = false;
+        {
+            size_t comma = line.find(',');
+            if (comma != std::string::npos) {
                         auto is_digits = [](const std::string& s) {
                             return !s.empty() &&
                                    std::all_of(s.begin(), s.end(),
@@ -156,7 +175,7 @@ bool parse_layout(const std::wstring& path, Layout& out, std::string* err) {
                     "default comment", "you can edit me",
                 };
                 bool skip = coord_header;
-                std::string lower = lower_ascii(line);
+                std::string lower = strutil::lower_ascii(line);
                 for (const auto& p : skip_prefixes)
                     if (lower.rfind(p, 0) == 0) { skip = true; break; }
                 if (!skip) {
@@ -176,7 +195,8 @@ bool parse_layout(const std::wstring& path, Layout& out, std::string* err) {
         // Entry header line: ----------------[N]----------------[x,y,g]
         if (line.size() > 2 && line[0] == '-') {
             int idx; double x, y; int g;
-            if (parse_entry_line(line, idx, x, y, g)) {
+            std::string why;
+            if (parse_entry_line(line, idx, x, y, g, &why)) {
                 TextEntry ne;
                 ne.index = idx;
                 ne.x = x;
@@ -184,6 +204,17 @@ bool parse_layout(const std::wstring& path, Layout& out, std::string* err) {
                 ne.group = g;
                 block->entries.push_back(std::move(ne));
                 entry = &block->entries.back();
+                continue;
+            }
+            if (!why.empty()) {
+                // Malformed entry header: report it and skip the line; the
+                // rest of the file keeps parsing so later entries still
+                // generate.
+                fprintf(stderr,
+                        "layout: %s: line %zu: skipping malformed entry "
+                        "header (%s): %s\n",
+                        textcodec::wide_to_utf8(path).c_str(),
+                        line_no, why.c_str(), line.c_str());
                 continue;
             }
         }

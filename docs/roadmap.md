@@ -16,21 +16,17 @@
 
 文本框尺寸、TySh em box 用粗估(CJK=1.0em、Latin=0.55em),不含字距/标点压缩;**两处实现必须同步修改**(main.cpp:142 `line_units` 与 psd_writer.cpp:936 `est_line_units`),这是改代码时最容易踩的坑。
 
-### 4. config 的 `outputDir` 字段无效
-
-`style.cpp:192` 会读取 `outputDir` 到 `Style::output_dir`,但 `main.cpp` 从不使用它(输出目录只由 `--out` / 默认规则决定)。要么实现,要么从文档与代码中移除。
-
-### 5. 平台绑定 Windows
+### 4. 平台绑定 Windows
 
 `wmain`、GDI+、Win32 对话框、`CP_ACP` 回退均为 Windows 专属。若要跨平台,需要替换的点是:图片加载/预览渲染(GDI+ → stb_image 或 Skia)、文件对话框、文本编码回退(GBK → iconv)。
 
-### 6. 仅点文本、仅 RGB 8-bit
+### 5. 仅点文本、仅 RGB 8-bit
 
 EngineData `ShapeType` 固定为 0(点文本);不写段落文本(ShapeType 1 + BoxBounds)。文件头固定 RGB 8-bit。对 LabelPlus 排版场景足够,扩展时需动 `build_tysh` / `build_document_bytes`。
 
-### 7. OCR 涂白的固有局限
+### 6. dbnet 涂白的固有局限
 
-OCR 涂白([ocr.md](ocr.md))已改为 m-i-t DBNet 的**逐像素笔画遮罩**(只填笔画,不再整块白矩形),深色背景上不再是显眼白块;但纯白填充在深色背景上仍是白笔画,复杂网点/花纹背景仍可能留边。改进方向:背景色取样填充、遮罩形态学优化。漏检的原文不会被涂白(宁漏勿错,`bg` 图层始终未被修改)。
+dbnet 涂白([dbnet.md](dbnet.md))已改为 m-i-t DBNet 的**逐像素笔画遮罩**(只填笔画,不再整块白矩形),深色背景上不再是显眼白块;但纯白填充在深色背景上仍是白笔画,复杂网点/花纹背景仍可能留边。改进方向:背景色取样填充、遮罩形态学优化。漏检的原文不会被涂白(宁漏勿错,`bg` 图层始终未被修改)。
 
 ## 历史:Txt2 路线的引入与回退
 
@@ -49,10 +45,9 @@ OCR 涂白([ocr.md](ocr.md))已改为 m-i-t DBNet 的**逐像素笔画遮罩**(�
 
 1. **最小单元测试**:先给 `build_tysh`/`build_lrfx` 写字节级断言(输入固定 `TextLayerData` → 输出 golden bytes,或用 psd-tools 回读断言),锁定最脆弱的 EngineData 序列化。接口已预留,不依赖 GDI+。
 2. **回归脚本化**:把"生成 testfile 样例 → psd-tools 断言图层树/文本/EngineData 关键字段"写成 pytest 脚本,替代人工对比。
-3. **决策 `outputDir` 去留**(见限制 4)。
-4. **行宽估算改进**:接入真实字形宽度(GDI+ `MeasureString` 已可用于预览,同源数据喂给 box 估算可消除两处估算不一致的风险)。
-5. **重新评估"免手动更新"**:若重启该方向,优先评估[最小合法字形数据](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/)只需覆盖 PS 检查的字段(而非 Txt2 的全量模板),或干脆预置 `TextIndex`/`Rendered.Children` 的精简变体。
-6. **跨平台**:见限制 5 的替换点清单。
+3. **行宽估算改进**:接入真实字形宽度(GDI+ `MeasureString` 已可用于预览,同源数据喂给 box 估算可消除两处估算不一致的风险)。
+4. **重新评估"免手动更新"**:若重启该方向,优先评估[最小合法字形数据](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/)只需覆盖 PS 检查的字段(而非 Txt2 的全量模板),或干脆预置 `TextIndex`/`Rendered.Children` 的精简变体。
+5. **跨平台**:见限制 4 的替换点清单。
 
 ## 文档维护约定
 
