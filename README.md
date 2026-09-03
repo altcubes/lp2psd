@@ -2,7 +2,7 @@
 
 根据 [LabelPlus](https://github.com/LabelPlus/LabelPlus) 排版 txt 生成多图层 PSD文件的 Windows 命令行工具。另可选用 DBNet 检测日文原文，生成涂白图层，省去嵌字流程里手动擦字的重复劳动。
 
-> ⚠️ **重要提示**：生成的 PSD 在 Photoshop 中打开后，需手动刷新文本排版：菜单 **文字(Y) → 更新所有文本图层(U)**。
+> ⚠️ **注意**：生成的 PSD 在 Photoshop 中打开后，需手动刷新文本排版：菜单 **文字(Y) → 更新所有文本图层(U)**。
 
 ## 系统要求与构建
 
