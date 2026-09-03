@@ -99,9 +99,3 @@ lp2psd.exe text.txt --config config.json --debug-dbnet build\dbnetdbg
 - `<图片名>_dbnet.png`：**绿 = 笔画遮罩、红 = 旋转四边形框**——调 `dbBinThreshold`/`dbBoxThreshold`/`segThreshold` 的主要手段；
 - `<图片名>_mask.png`：灰度笔画遮罩；
 - `<图片名>_quads.json`：机器可读的四边形与分数（供 parity 对比）。
-
-## 已知限制
-
-- 深色背景上的文字涂白后是白色笔画（纯白填充的固有局限）；比整块白矩形自然得多，但仍可在 PS 中改色或取样背景色。
-- 遮罩偶尔覆盖到网点/气泡等小图案，会造成小面积涂白；可调大 `minBoxArea` 或调高 `segThreshold` 过滤。
-- 手写体/艺术字可能漏检或遮罩不完整；漏检的文字不会被涂白（宁漏勿错，原图层始终未被修改，可在 PS 中手动补）。
