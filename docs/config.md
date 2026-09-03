@@ -63,11 +63,14 @@ JSON 不支持注释,本文档即字段说明。未写的字段取内置默认;�
 | `whiten.layerName` | 字符串 | `"whites"` | 涂白图层名(图层紧贴原图层之上) |
 | `whiten.transparency` | 数字 | `0` | 涂白图层的透明程度(%),范围 0~100。0 = 完全不透明,100 = 完全透明(等价于图层不透明度 = 100 − transparency)。与 `layers.opacity` 相乘生效 |
 
-`limitToBoxes` 下,被 `dbBoxThreshold`/`minBoxArea` 过滤掉(无框)的弱文字 mask 区域不再涂白——若想保留弱文字,优先下调这两个框阈值,而不是直接关闭 `limitToBoxes`。`--debug-dbnet` 会额外输出 `<图片名>_whiten.png`(白 = 最终涂白像素)便于目检。
-| `boxes.enabled` | 布尔 | `false` | 检测框描边图层开关:在图层栈**最顶部**生成 1px 红框透明图层,按旋转四边形描边,标记每处涂白位置 |
+`limitToBoxes` 下，被 `dbBoxThreshold`/`minBoxArea` 过滤掉（无框）的弱文字 mask 区域不再涂白——若想保留弱文字，优先下调这两个框阈值，而不是直接关闭 `limitToBoxes`。
+
+| 参数 | 类型 | 默认值 | 描述 |
+| --- | --- | --- | --- |
+| `boxes.enabled` | 布尔 | `false` | 检测框描边图层开关：在图层栈**最顶部**生成 1px 红框透明图层，按旋转四边形描边，标记每处涂白位置 |
 | `boxes.color` | `[R,G,B]` | `[255,0,0]` | 描边颜色 |
 | `boxes.layerName` | 字符串 | `"dbnet_boxes"` | 描边图层名 |
-| `boxes.lock` | 布尔 | `false` | **仅对** `dbnet_boxes` 图层生效:为 `true` 时锁定全部(透明像素 + 图像像素 + 位置,`lspf = 0x07`,PS"锁定全部"),防止误编辑 |
+| `boxes.lock` | 布尔 | `false` | **仅对** `dbnet_boxes` 图层生效：为 `true` 时锁定 |
 
 ## `bgCopy` — 背景拷贝图层(可选)
 
